@@ -1,125 +1,120 @@
 # Claude Code GUI
 
-A lightweight, native-feeling desktop GUI for the [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI — macOS only.
+一个轻量、原生体验的 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 桌面图形界面 —— 仅支持 macOS。
 
-Built with **Electron + React + TypeScript + SQLite + Tailwind CSS**, Claude Code GUI wraps the `claude` command-line tool into a polished multi-window chat experience with full conversation persistence, streaming responses, file/image attachments, and more.
+基于 **Electron + React + TypeScript + SQLite + Tailwind CSS** 构建，Claude Code GUI 将 `claude` 命令行工具封装为一个精致的多窗口对话体验，具备完整的会话持久化、流式响应、文件/图片附件等功能。
 
-> ⚠️ This project is an independent, community-built client and is **not** affiliated with or endorsed by Anthropic. It requires a working installation of the official `claude` CLI.
+> ⚠️ 本项目是社区独立开发的客户端，**不**隶属于 Anthropic，也未经其认可。使用前需先安装官方 `claude` CLI。
 
-## Features
+## 功能特性
 
-- **Multi-window conversations** — Open each conversation in its own window, or keep them all in the sidebar. Cross-window sync keeps everything in lockstep.
-- **Streaming responses** — Assistant replies stream in real time via `--output-format stream-json`.
-- **SQLite persistence** — Every conversation and message is stored locally with WAL mode, so nothing is lost on crash or restart.
-- **Crash-safe streaming** — Assistant text is flushed to the database incrementally (throttled), so a mid-stream crash preserves the partial response.
-- **Session resume** — Captures the Claude CLI session id and uses `--resume` to continue a conversation thread.
-- **Model selector** — Switch models per conversation.
-- **Project context** — Bind a conversation to a project folder (`cwd`), grouped in the sidebar tree.
-- **File & image attachments** — Attach files (referenced as `@path`) and images (sent as base64 content blocks). macOS Finder clipboard paste is supported.
-- **Pin / rename / delete** — Full conversation management with a context menu.
-- **Dark & light themes** — Follows the system theme by default, with manual override.
-- **Keyboard shortcuts** — `⌘N` new chat · `⌘B` toggle sidebar · `⌘K` search · `Esc` stop generation.
-- **Secure by default** — `contextIsolation: true`, `nodeIntegration: false`, with a hardened preload bridge.
+- **多窗口会话** —— 每个会话可在独立窗口打开，也可全部收纳在侧边栏。跨窗口同步确保数据始终一致。
+- **流式响应** —— 助手回复通过 `--output-format stream-json` 实时流式呈现。
+- **SQLite 持久化** —— 所有会话和消息以 WAL 模式存储在本地，崩溃或重启也不会丢失。
+- **崩溃安全流式** —— 助手文本以节流方式增量写入数据库，即使流式中途崩溃也能保留部分回复。
+- **会话续接** —— 自动捕获 Claude CLI 的 session id，使用 `--resume` 延续对话线程。
+- **模型选择** —— 可为每个会话单独切换模型。
+- **项目上下文** —— 将会话绑定到项目文件夹（`cwd`），在侧边栏树状分组展示。
+- **文件与图片附件** —— 支持附加文件（以 `@path` 引用）和图片（以 base64 内容块发送）。支持 macOS Finder 剪贴板粘贴。
+- **置顶 / 重命名 / 删除** —— 通过右键菜单完整管理会话。
+- **深色与浅色主题** —— 默认跟随系统主题，可手动切换。
+- **快捷键** —— `⌘N` 新建会话 · `⌘B` 切换侧边栏 · `⌘K` 搜索 · `Esc` 停止生成。
+- **安全默认** —— `contextIsolation: true`、`nodeIntegration: false`，配合加固的 preload 桥接层。
 
-## Prerequisites
+## 前置条件
 
-1. **macOS** (the app uses macOS-specific window styling and clipboard features).
-2. **Node.js** ≥ 18 and npm.
-3. **Claude Code CLI** installed and available on your `PATH`:
+1. **macOS**（应用使用了 macOS 专属的窗口样式与剪贴板特性）。
+2. **Node.js** ≥ 18 及 npm。
+3. 已安装并在 `PATH` 中可用的 **Claude Code CLI**：
    ```bash
    npm install -g @anthropic-ai/claude-code
    ```
-   Verify with `claude --version`.
+   使用 `claude --version` 验证安装。
 
-## Getting Started
+## 快速开始
 
 ```bash
-# clone
+# 克隆仓库
 git clone git@github.com:d2025440304-ops/Claude-code-GUI.git
 cd Claude-code-GUI
 
-# install dependencies
+# 安装依赖
 npm install
 
-# run in development (Vite + tsc --watch + Electron)
+# 开发模式运行（Vite + tsc --watch + Electron）
 npm run dev
 
-# build for production
+# 生产构建
 npm run build
 
-# launch the built app
+# 启动构建后的应用
 npm start
 ```
 
-The dev server runs on `http://127.0.0.1:5174` and hot-reloads the renderer. The Electron main process recompiles on TypeScript changes.
+开发服务器运行在 `http://127.0.0.1:5174`，渲染进程支持热重载。Electron 主进程在 TypeScript 变更时自动重新编译。
 
-## Architecture
+## 架构
 
 ```
 claude-code-desktop/
-├── electron/               # Main process (Node.js / Electron)
-│   ├── main.ts             # App bootstrap, IPC handlers, lifecycle
-│   ├── preload.ts          # Context-isolated IPC bridge
-│   ├── ipc/channels.ts     # Typed IPC channel names
+├── electron/               # 主进程（Node.js / Electron）
+│   ├── main.ts             # 应用引导、IPC 处理、生命周期
+│   ├── preload.ts          # 上下文隔离的 IPC 桥接
+│   ├── ipc/channels.ts     # 类型化的 IPC 通道名
 │   ├── integration/
-│   │   ├── cli-detector.ts # Detects `claude` on PATH
-│   │   ├── cli-spawner.ts   # Spawns & manages Claude CLI subprocesses
-│   │   └── stream-parser.ts# Parses stream-json output into chunks
+│   │   ├── cli-detector.ts # 检测 PATH 中的 `claude`
+│   │   ├── cli-spawner.ts  # 生成并管理 Claude CLI 子进程
+│   │   └── stream-parser.ts# 将 stream-json 输出解析为分块
 │   └── db/
-│       ├── database.ts                 # SQLite wrapper (WAL, migrations)
-│       ├── migrations/001-init.sql     # Schema
-│       └── repositories/               # Conversation & message repos
-├── src/                    # Renderer process (React)
-│   ├── App.tsx             # Sidebar, project tree, routing
-│   ├── components/         # ChatView, ConversationItem, ModelSelector, …
-│   ├── lib/ipc.ts          # Renderer-side IPC helpers
-│   └── types.ts            # Shared types & model list
+│       ├── database.ts             # SQLite 封装（WAL、迁移）
+│       ├── migrations/001-init.sql # 数据库 schema
+│       └── repositories/           # 会话与消息仓库
+├── src/                    # 渲染进程（React）
+│   ├── App.tsx             # 侧边栏、项目树、路由
+│   ├── components/         # ChatView、ConversationItem、ModelSelector 等
+│   ├── lib/ipc.ts          # 渲染进程侧 IPC 辅助
+│   └── types.ts            # 共享类型与模型列表
 ├── index.html
 └── vite.config.ts
 ```
 
-### How it works
+### 工作原理
 
-1. The renderer sends a message via the typed IPC bridge (`preload.ts`).
-2. The main process persists the user message, then spawns a one-shot
+1. 渲染进程通过类型化的 IPC 桥接（`preload.ts`）发送消息。
+2. 主进程持久化用户消息后，在会话所属的项目文件夹中生成一次性子进程：
    `claude -p "<msg>" --output-format stream-json --verbose --include-partial-messages [--resume <id>]`
-   subprocess in the conversation's project folder.
-3. A `StreamParser` incrementally parses the NDJSON stdout into typed chunks
-   (`text`, `meta`, `tool`, `error`).
-4. Chunks are routed only to the window(s) bound to that conversation, and the
-   accumulated assistant text is flushed to SQLite on a 400 ms throttle so a
-   crash never loses the partial reply.
-5. On stream close, the conversation preview is updated and all sidebars are
-   refreshed across windows.
+3. `StreamParser` 增量地将 NDJSON stdout 解析为类型化分块（`text`、`meta`、`tool`、`error`）。
+4. 分块仅路由到绑定该会话的窗口；累积的助手文本以 400ms 节流写入 SQLite，确保崩溃不丢失部分回复。
+5. 流结束时更新会话预览，并跨窗口刷新所有侧边栏。
 
-## Tech Stack
+## 技术栈
 
-| Layer        | Technology                                   |
-| ------------ | -------------------------------------------- |
-| Shell        | Electron 31                                   |
-| UI           | React 18 + TypeScript 5                       |
-| Styling      | Tailwind CSS 3 + CSS variables (theming)      |
-| State        | Zustand / React hooks                         |
-| Storage      | better-sqlite3 (WAL mode, migrations)         |
-| Build        | Vite 5 (renderer) + tsc (main)               |
-| Integration  | Claude Code CLI (`stream-json` protocol)      |
+| 层级     | 技术                                          |
+| -------- | --------------------------------------------- |
+| 外壳     | Electron 31                                   |
+| 界面     | React 18 + TypeScript 5                       |
+| 样式     | Tailwind CSS 3 + CSS 变量（主题化）           |
+| 状态     | Zustand / React hooks                         |
+| 存储     | better-sqlite3（WAL 模式、迁移）              |
+| 构建     | Vite 5（渲染进程）+ tsc（主进程）             |
+| 集成     | Claude Code CLI（`stream-json` 协议）         |
 
-## Project Roadmap
+## 路线图
 
-- Cross-platform support (Windows / Linux)
-- Slash-command palette
-- Conversation search (full-text)
-- Export conversations (Markdown / JSON)
-- Configurable CLI flags & system prompts
+- 跨平台支持（Windows / Linux）
+- 斜杠命令面板
+- 会话全文搜索
+- 导出会话（Markdown / JSON）
+- 可配置的 CLI 参数与系统提示词
 
-## Contributing
+## 贡献
 
-Contributions are welcome! Please open an issue first to discuss what you'd like to change, then submit a pull request.
+欢迎贡献！请先开一个 issue 讨论你想做的改动，然后提交 Pull Request。
 
-1. Fork the repo and create your branch: `git checkout -b feat/my-feature`
-2. Commit with clear messages
-3. Open a Pull Request against `main`
+1. Fork 仓库并创建分支：`git checkout -b feat/my-feature`
+2. 使用清晰的提交信息
+3. 向 `main` 分支发起 Pull Request
 
-## License
+## 许可证
 
 [MIT](./LICENSE) © Yu-dai
