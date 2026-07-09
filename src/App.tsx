@@ -1,13 +1,16 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Plus, Search, Pin, FolderOpen, Settings, ChevronDown, Sparkles, Edit3, Loader2, Trash2, X, MessageSquare, Hash, Sun, Moon, PanelLeft, ExternalLink } from 'lucide-react'
+import { Plus, Search, Pin, FolderOpen, Settings, ChevronDown, Sparkles, Edit3, Loader2, Trash2, X, MessageSquare, Hash, Sun, Moon, PanelLeft, ExternalLink, History, Terminal, Globe, PanelRight, MessageCircle } from 'lucide-react'
 import ChatView from './components/ChatView'
+import ClaudeTerminalView from './components/ClaudeTerminalView'
+import ImportedChatView from './components/ImportedChatView'
+import RightPanel from './components/RightPanel'
 import ConversationItem from './components/ConversationItem'
 import ModelSelector from './components/ModelSelector'
 import ProjectSelector from './components/ProjectSelector'
 import ConfirmDialog from './components/ConfirmDialog'
 import { ipc } from './lib/ipc'
-import type { Conversation, Message, Attachment } from './types'
-import { MODELS } from './types'
+import type { Conversation, Message, Attachment, HistoryConversation, HistoryConversationDetail, PermissionMode, ThinkingEffort, ModelOption, ContentBlock } from './types'
+import { MODELS, PERMISSION_MODES, THINKING_EFFORTS } from './types'
 
 /* ---------- helpers ---------- */
 
@@ -15,6 +18,110 @@ function getProjectName(path: string | null): string | null {
   if (!path) return null
   const parts = path.split('/')
   return parts[parts.length - 1] || path
+}
+
+/** 安全解析 JSON，失败返回 undefined */
+function safeParseJSON(s?: string): Record<string, unknown> | undefined {
+  if (!s) return undefined
+  try { return JSON.parse(s) as Record<string, unknown> } catch { return undefined }
+}
+
+/** 流式 chunk 类型（与后端 ParsedChunk 对齐） */
+interface StreamChunk {
+  type: string
+  content?: string
+  tool?: string
+  input?: string
+  toolUseId?: string
+  stdout?: string
+  stderr?: string
+  isError?: boolean
+  diff?: Array<{ oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }>
+  filePath?: string
+  error?: string
+  blockStart?: boolean
+}
+
+/**
+ * 将流式 chunk 应用到 assistant message 的 contentBlocks 数组。
+ *
+ * 规则：
+ * - text/thinking：blockStart=true 时新建 block；否则追加到最后一个同类型 streaming block
+ * - tool_use：blockStart=true 新建（只有 toolName+toolUseId）；后续带 input 的更新同 toolUseId 的 block
+ * - tool_result：按 toolUseId 关联到对应 tool_use block，填入 stdout/diff/isError
+ * - permission_denial：直接新建
+ */
+function applyChunkToBlocks(blocks: ContentBlock[], chunk: StreamChunk): ContentBlock[] {
+  const next = [...blocks]
+
+  switch (chunk.type) {
+    case 'text': {
+      if (chunk.blockStart || next.length === 0 || next[next.length - 1].type !== 'text' || next[next.length - 1].status !== 'streaming') {
+        next.push({ id: crypto.randomUUID(), type: 'text', content: chunk.content || '', status: 'streaming' })
+      } else {
+        const last = next[next.length - 1]
+        next[next.length - 1] = { ...last, content: (last.content || '') + (chunk.content || '') }
+      }
+      break
+    }
+    case 'thinking': {
+      if (chunk.blockStart || next.length === 0 || next[next.length - 1].type !== 'thinking' || next[next.length - 1].status !== 'streaming') {
+        next.push({ id: crypto.randomUUID(), type: 'thinking', content: chunk.content || '', status: 'streaming' })
+      } else {
+        const last = next[next.length - 1]
+        next[next.length - 1] = { ...last, content: (last.content || '') + (chunk.content || '') }
+      }
+      break
+    }
+    case 'tool_use': {
+      // 带 input：更新已存在的 block（content_block_stop 触发）
+      if (chunk.input && chunk.toolUseId) {
+        const idx = next.findIndex(b => b.toolUseId === chunk.toolUseId)
+        if (idx >= 0) {
+          next[idx] = { ...next[idx], toolName: chunk.tool || next[idx].toolName, toolInput: safeParseJSON(chunk.input), status: 'completed' }
+        } else {
+          next.push({ id: crypto.randomUUID(), type: 'tool_use', toolName: chunk.tool, toolUseId: chunk.toolUseId, toolInput: safeParseJSON(chunk.input), status: 'completed' })
+        }
+      } else if (chunk.toolUseId) {
+        // content_block_start：新建 streaming tool_use block
+        next.push({ id: crypto.randomUUID(), type: 'tool_use', toolName: chunk.tool, toolUseId: chunk.toolUseId, status: 'streaming' })
+      }
+      break
+    }
+    case 'tool_result': {
+      if (chunk.toolUseId) {
+        const idx = next.findIndex(b => b.toolUseId === chunk.toolUseId)
+        const resultPatch: Partial<ContentBlock> = {
+          stdout: chunk.stdout,
+          stderr: chunk.stderr,
+          diff: chunk.diff,
+          filePath: chunk.filePath,
+          isError: chunk.isError,
+          content: chunk.content,
+          status: chunk.isError ? 'error' : 'completed',
+        }
+        if (idx >= 0) {
+          next[idx] = { ...next[idx], ...resultPatch }
+        } else {
+          next.push({ id: crypto.randomUUID(), type: 'tool_result', toolUseId: chunk.toolUseId, ...resultPatch } as ContentBlock)
+        }
+      }
+      break
+    }
+    case 'permission_denial': {
+      next.push({
+        id: crypto.randomUUID(),
+        type: 'permission_denial',
+        toolName: chunk.tool,
+        toolInput: safeParseJSON(chunk.input),
+        content: chunk.content,
+        status: 'error',
+      })
+      break
+    }
+  }
+
+  return next
 }
 
 /* ---------- App ---------- */
@@ -29,6 +136,8 @@ export default function App() {
     } catch { return null }
   })
   const [selectedModel, setSelectedModel] = useState('default')
+  // 模型列表：从 ~/.claude/settings.json (cc-switch) 动态加载，MODELS 仅作 fallback
+  const [models, setModels] = useState<ModelOption[]>(MODELS)
   const [searchQuery, setSearchQuery] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
   const [isStreaming, setIsStreaming] = useState(false)
@@ -55,15 +164,44 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     try { return localStorage.getItem('ccd:sidebar') === '1' } catch { return false }
   })
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try { return Number(localStorage.getItem('ccd:sidebarWidth')) || 288 } catch { return 288 }
+  })
+  const [rightPanelOpen, setRightPanelOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem('ccd:rightPanel') === '1' } catch { return false }
+  })
+  // 视图模式：terminal = 交互式 Claude Code 终端；chat = 结构化 GUI 聊天
+  const [viewMode, setViewMode] = useState<'terminal' | 'chat'>(() => {
+    try { return (localStorage.getItem('ccd:viewMode') as 'terminal' | 'chat') || 'terminal' } catch { return 'terminal' }
+  })
+  // 拖拽状态
+  const isDraggingSidebarRef = useRef(false)
   // CLI 安装状态：null = 还在检测，{installed, version} = 检测结果
   const [cliInfo, setCliInfo] = useState<{ installed: boolean; version: string | null; error?: string } | null>(null)
   // 设置面板开关
   const [showSettings, setShowSettings] = useState(false)
+  // 权限模式
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => {
+    try { return (localStorage.getItem('ccd:perm') as PermissionMode) || 'ask' } catch { return 'ask' }
+  })
+  // 思考等级
+  const [thinkingEffort, setThinkingEffort] = useState<ThinkingEffort>(() => {
+    try { return (localStorage.getItem('ccd:effort') as ThinkingEffort) || 'medium' } catch { return 'medium' }
+  })
   // 确认对话框状态
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string; message: string; confirmLabel?: string; danger?: boolean;
     onConfirm: () => void
   } | null>(null)
+
+  // Claude Code 历史对话
+  const [historyConvs, setHistoryConvs] = useState<HistoryConversation[]>([])
+  const [activeHistoryId, setActiveHistoryId] = useState<string | null>(null)
+  const [historyDetail, setHistoryDetail] = useState<HistoryConversationDetail | null>(null)
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const [historyExpanded, setHistoryExpanded] = useState<Set<string>>(() => {
+    try { const v = localStorage.getItem('ccd:historyExpanded'); return new Set<string>(v ? JSON.parse(v) : []) } catch { return new Set<string>() }
+  })
 
   const activeConvIdRef = useRef<string | null>(null)
   useEffect(() => { activeConvIdRef.current = activeConvId }, [activeConvId])
@@ -95,6 +233,13 @@ export default function App() {
     loadConversations()
   }, [])
 
+  /* ---- 加载 Claude Code 历史对话 ---- */
+  useEffect(() => {
+    ipc.invoke<HistoryConversation[]>('history:scan').then(setHistoryConvs).catch(() => {})
+  }, [])
+
+  useEffect(() => { try { localStorage.setItem('ccd:historyExpanded', JSON.stringify(Array.from(historyExpanded))) } catch {} }, [historyExpanded])
+
   /* ---- 检测 Claude CLI 安装状态 ---- */
   useEffect(() => {
     ipc.invoke<{ installed: boolean; version: string | null; error?: string }>('cli:check')
@@ -102,11 +247,62 @@ export default function App() {
       .catch((e) => setCliInfo({ installed: false, version: null, error: String(e) }))
   }, [])
 
+  /* ---- 加载 cc-switch 配置（模型列表 + 默认努力等级） ----
+   * 从 ~/.claude/settings.json 读取别名 -> 真实模型的映射，
+   * 动态生成模型列表，替换硬编码的 MODELS。
+   * 首次加载（localStorage 无记录）时用 cc-switch 的 effortLevel 初始化。 */
+  useEffect(() => {
+    interface ConfigReadResult {
+      models: ModelOption[]
+      defaultModel: string
+      effortLevel: string
+      currentAlias: string
+    }
+    ipc.invoke<ConfigReadResult>('config:read')
+      .then((cfg) => {
+        if (cfg?.models?.length) setModels(cfg.models)
+        // 首次运行（无 localStorage 记录）时同步 cc-switch 的 effortLevel
+        try {
+          const stored = localStorage.getItem('ccd:effort')
+          if (!stored && cfg.effortLevel) {
+            const valid = ['none', 'low', 'medium', 'high']
+            if (valid.includes(cfg.effortLevel)) setThinkingEffort(cfg.effortLevel as ThinkingEffort)
+          }
+        } catch {}
+      })
+      .catch((e) => console.error('Failed to load cc-switch config:', e))
+  }, [])
+
   // Persist session state across reloads.
   useEffect(() => { try { localStorage.setItem('ccd:conv', activeConvId || '') } catch {} }, [activeConvId])
   useEffect(() => { try { localStorage.setItem('ccd:project', newChatProjectPath || '') } catch {} }, [newChatProjectPath])
   useEffect(() => { try { localStorage.setItem('ccd:expanded', JSON.stringify(Array.from(expandedProjects))) } catch {} }, [expandedProjects])
   useEffect(() => { try { localStorage.setItem('ccd:sidebar', sidebarCollapsed ? '1' : '0') } catch {} }, [sidebarCollapsed])
+  useEffect(() => { try { localStorage.setItem('ccd:sidebarWidth', String(sidebarWidth)) } catch {} }, [sidebarWidth])
+  useEffect(() => { try { localStorage.setItem('ccd:rightPanel', rightPanelOpen ? '1' : '0') } catch {} }, [rightPanelOpen])
+  useEffect(() => { try { localStorage.setItem('ccd:viewMode', viewMode) } catch {} }, [viewMode])
+  useEffect(() => { try { localStorage.setItem('ccd:perm', permissionMode) } catch {} }, [permissionMode])
+  useEffect(() => { try { localStorage.setItem('ccd:effort', thinkingEffort) } catch {} }, [thinkingEffort])
+
+  // 侧边栏拖拽调整大小
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDraggingSidebarRef.current) return
+      const newWidth = Math.min(500, Math.max(200, e.clientX))
+      setSidebarWidth(newWidth)
+    }
+    const handleMouseUp = () => {
+      isDraggingSidebarRef.current = false
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [])
 
   // Bind this window's active conversation to the main process so stream
   // chunks are routed here. Re-binds whenever the active conversation changes.
@@ -114,10 +310,21 @@ export default function App() {
     ipc.invoke('window:bind', { convId: activeConvId }).catch(() => {})
   }, [activeConvId])
 
+  // Stop session watcher when switching conversations (the new one will be started on sessionId capture)
+  const prevConvIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (prevConvIdRef.current && prevConvIdRef.current !== activeConvId) {
+      ipc.invoke('session-watcher:stop', { id: prevConvIdRef.current }).catch(() => {})
+    }
+    prevConvIdRef.current = activeConvId
+  }, [activeConvId])
+
   /* ---- select conversation and load messages ---- */
   const selectConversation = useCallback(async (id: string) => {
     if (isStreaming) return
     setActiveConvId(id)
+    setActiveHistoryId(null) // 清除历史对话选中状态
+    setHistoryDetail(null)
     setLoadingMsgs(true)
     setError(null)
     try {
@@ -166,20 +373,32 @@ export default function App() {
 
   /* ---- subscribe to stream events ---- */
   useEffect(() => {
-    const unsubChunk = ipc.on('stream:chunk', (data: { conversationId: string; chunk: { type: string; content?: string; tool?: string; error?: string } }) => {
+    const unsubChunk = ipc.on('stream:chunk', (data: { conversationId: string; chunk: StreamChunk }) => {
       if (data.conversationId !== activeConvIdRef.current) return
       const chunk = data.chunk
-      if (chunk.type === 'text' && chunk.content) {
+
+      // text / thinking / tool_use / tool_result / permission_denial：累积到 contentBlocks
+      if (['text', 'thinking', 'tool_use', 'tool_result', 'permission_denial'].includes(chunk.type)) {
         setMessages((prev) => {
           const last = prev[prev.length - 1]
           if (last && last.role === 'assistant') {
-            return [...prev.slice(0, -1), { ...last, content: last.content + chunk.content }]
+            const blocks = applyChunkToBlocks(last.contentBlocks || [], chunk)
+            // text 同时累积到 content 字段（向后兼容 + 持久化摘要）
+            const newContent = chunk.type === 'text' && chunk.content
+              ? last.content + chunk.content
+              : last.content
+            return [...prev.slice(0, -1), { ...last, content: newContent, contentBlocks: blocks }]
           }
-          return prev
+          // 没有 assistant message 时创建一个
+          const blocks = applyChunkToBlocks([], chunk)
+          const initContent = chunk.type === 'text' && chunk.content ? chunk.content : ''
+          return [...prev, { id: crypto.randomUUID(), conversationId: data.conversationId, role: 'assistant' as const, content: initContent, contentBlocks: blocks, timestamp: new Date().toISOString() }]
         })
-      } else if (chunk.type === 'text-replace' && chunk.content !== undefined) {
-        // Replay of accumulated text when binding a window to a mid-stream
-        // conversation (opened in a new window). Replace, don't append.
+        return
+      }
+
+      // text-replace：窗口绑定时重放累积文本
+      if (chunk.type === 'text-replace' && chunk.content !== undefined) {
         setIsStreaming(true)
         setMessages((prev) => {
           const last = prev[prev.length - 1]
@@ -188,7 +407,11 @@ export default function App() {
           }
           return [...prev, { id: crypto.randomUUID(), conversationId: data.conversationId, role: 'assistant' as const, content: chunk.content!, timestamp: new Date().toISOString() }]
         })
-      } else if (chunk.type === 'error' && chunk.error) {
+        return
+      }
+
+      // error
+      if (chunk.type === 'error' && chunk.error) {
         setMessages((prev) => {
           const last = prev[prev.length - 1]
           const errMsg = 'Error: ' + chunk.error
@@ -248,6 +471,8 @@ export default function App() {
       })
       setConversations((prev) => [conv, ...prev])
       setActiveConvId(conv.id)
+      setActiveHistoryId(null)
+      setHistoryDetail(null)
       setMessages([])
       setError(null)
       if (conv.projectPath) setExpandedProjects((prev) => new Set(prev).add(conv.projectPath!))
@@ -288,6 +513,7 @@ export default function App() {
       const mod = e.metaKey || e.ctrlKey
       if (mod && e.key === 'n') { e.preventDefault(); newChatRef.current() }
       else if (mod && e.key === 'b') { e.preventDefault(); setSidebarCollapsed((v) => !v) }
+      else if (mod && e.key === 'j') { e.preventDefault(); setRightPanelOpen((v) => !v) }
       else if (mod && e.key === 'k') { e.preventDefault(); searchInputRef.current?.focus() }
       else if (e.key === 'Escape' && isStreamingRef.current) { e.preventDefault(); stopRef.current() }
     }
@@ -392,6 +618,25 @@ export default function App() {
   }
   stopRef.current = handleStop
 
+  /* ---- 选择历史对话 ---- */
+  const selectHistoryConversation = useCallback(async (conv: HistoryConversation) => {
+    if (isStreaming) return
+    setActiveHistoryId(conv.sessionId)
+    setActiveConvId(null) // 取消普通对话的选中状态
+    setLoadingHistory(true)
+    try {
+      const detail = await ipc.invoke<HistoryConversationDetail | null>('history:messages', {
+        projectPath: conv.projectPath,
+        sessionId: conv.sessionId,
+      })
+      setHistoryDetail(detail)
+    } catch {
+      setHistoryDetail(null)
+    } finally {
+      setLoadingHistory(false)
+    }
+  }, [isStreaming])
+
   /* ---- send message ---- */
   const handleSend = async (text: string, attachments: Attachment[] = []) => {
     if (!activeConvId || isStreaming) return
@@ -417,7 +662,13 @@ export default function App() {
     setIsStreaming(true)
 
     try {
-      const res = await ipc.invoke<{ ok: boolean; error?: string }>('message:send', { conversationId: activeConvId, message: text, attachments })
+      const res = await ipc.invoke<{ ok: boolean; error?: string }>('message:send', {
+        conversationId: activeConvId,
+        message: text,
+        attachments,
+        permissionMode,
+        thinkingEffort,
+      })
       if (!res?.ok) {
         setIsStreaming(false)
         setError(res?.error || 'Failed to send message')
@@ -438,6 +689,57 @@ export default function App() {
       })
     }
   }
+
+  /* ---- 权限拒绝后一键批准重发 ---- */
+  const handleResendWithPermission = useCallback(async () => {
+    if (!activeConvId || isStreaming) return
+    // 找到最后一条用户消息
+    const lastUser = [...messages].reverse().find(m => m.role === 'user')
+    if (!lastUser) return
+    // 切换到 auto-edit 模式
+    setPermissionMode('auto-edit')
+    // 清除之前的权限拒绝 blocks，保留 text 部分
+    setMessages((prev) => {
+      const last = prev[prev.length - 1]
+      if (last && last.role === 'assistant') {
+        const cleanedBlocks = (last.contentBlocks || []).filter(b => b.type !== 'permission_denial')
+        return [...prev.slice(0, -1), { ...last, contentBlocks: cleanedBlocks }]
+      }
+      return prev
+    })
+    // 用 auto-edit 模式重新发送
+    const now = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
+    const assistantMsg: Message = {
+      id: crypto.randomUUID(),
+      conversationId: activeConvId,
+      role: 'assistant',
+      content: '',
+      timestamp: now,
+    }
+    setMessages((prev) => [...prev, assistantMsg])
+    setIsStreaming(true)
+    try {
+      const res = await ipc.invoke<{ ok: boolean; error?: string }>('message:send', {
+        conversationId: activeConvId,
+        message: lastUser.content,
+        attachments: lastUser.attachments || [],
+        permissionMode: 'auto-edit',
+        thinkingEffort,
+      })
+      if (!res?.ok) {
+        setIsStreaming(false)
+        setError(res?.error || 'Failed to resend')
+        setMessages((prev) => {
+          const last = prev[prev.length - 1]
+          if (last && last.role === 'assistant' && !last.content && !last.contentBlocks?.length) return prev.slice(0, -1)
+          return prev
+        })
+      }
+    } catch (e) {
+      setIsStreaming(false)
+      setError('Failed to resend message')
+    }
+  }, [activeConvId, isStreaming, messages, thinkingEffort])
 
   /* ---- 切换模型：同步到当前 conversation ---- */
   const handleModelSelect = useCallback(async (modelId: string) => {
@@ -520,9 +822,21 @@ export default function App() {
 
       {/* Left sidebar */}
       <aside
-        className="glass sidebar-accent flex flex-col flex-shrink-0"
-        style={{ width: sidebarCollapsed ? 0 : '288px', borderRight: sidebarCollapsed ? 'none' : '1px solid var(--border-default)', transition: 'width 200ms ease', overflow: 'hidden' }}
+        className="glass sidebar-accent flex flex-col flex-shrink-0 relative"
+        style={{ width: sidebarCollapsed ? 0 : `${sidebarWidth}px`, borderRight: sidebarCollapsed ? 'none' : '1px solid var(--border-default)', transition: isDraggingSidebarRef.current ? 'none' : 'width 200ms ease', overflow: 'hidden' }}
       >
+        {/* 右边缘拖拽条 */}
+        {!sidebarCollapsed && (
+          <div
+            className="absolute top-0 right-0 bottom-0 w-1 cursor-col-resize hover:bg-[var(--accent-primary)] transition-colors z-10"
+            onMouseDown={(e) => {
+              e.preventDefault()
+              isDraggingSidebarRef.current = true
+              document.body.style.cursor = 'col-resize'
+              document.body.style.userSelect = 'none'
+            }}
+          />
+        )}
         {/* macOS traffic light drag region */}
         <div className="drag-region flex-shrink-0" style={{ height: '36px' }} />
         {/* Logo / brand header */}
@@ -560,7 +874,7 @@ export default function App() {
 
         {/* Model selector */}
         <div className="px-4 pb-2.5">
-          <ModelSelector selected={selectedModel} models={MODELS} onSelect={handleModelSelect} />
+          <ModelSelector selected={selectedModel} models={models} onSelect={handleModelSelect} />
         </div>
 
 
@@ -664,6 +978,100 @@ export default function App() {
                   <span className="text-[11px] text-[var(--fg-quaternary)]">Start a new chat to begin</span>
                 </div>
               )}
+
+              {/* 历史记录分组 */}
+              {historyConvs.length > 0 && (() => {
+                // 按项目分组
+                const histMap = new Map<string, HistoryConversation[]>()
+                for (const h of historyConvs) {
+                  const key = h.projectPath || ''
+                  const arr = histMap.get(key)
+                  if (arr) arr.push(h)
+                  else histMap.set(key, [h])
+                }
+                const histProjects = Array.from(histMap.keys())
+                  .sort((a, b) => {
+                    const aTime = histMap.get(a)![0]?.updatedAt || ''
+                    const bTime = histMap.get(b)![0]?.updatedAt || ''
+                    return bTime.localeCompare(aTime)
+                  })
+                  .map(k => ({
+                    key: k,
+                    name: k ? getProjectName(k) || k : 'Other',
+                    convs: histMap.get(k)!,
+                  }))
+
+                return (
+                  <div className="mt-3 pt-3" style={{ borderTop: '1px solid var(--border-subtle)' }}>
+                    <div className="flex items-center gap-1.5 px-2.5 py-2">
+                      <History size={9} className="text-[var(--fg-quaternary)]" />
+                      <span className="text-[10px] font-semibold text-[var(--fg-quaternary)] uppercase" style={{ letterSpacing: '0.08em' }}>
+                        History ({historyConvs.length})
+                      </span>
+                    </div>
+                    {histProjects.map((proj) => {
+                      const expanded = historyExpanded.has(proj.key)
+                      return (
+                        <div key={proj.key || '__other'} className="mb-1">
+                          <button
+                            onClick={() => {
+                              setHistoryExpanded((prev) => {
+                                const next = new Set(prev)
+                                if (next.has(proj.key)) next.delete(proj.key)
+                                else next.add(proj.key)
+                                return next
+                              })
+                            }}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg transition-colors text-left"
+                          >
+                            <ChevronDown
+                              size={12}
+                              className="text-[var(--fg-quaternary)] transition-transform"
+                              style={{ transform: expanded ? 'rotate(0deg)' : 'rotate(-90deg)' }}
+                            />
+                            {proj.key
+                              ? <FolderOpen size={12} className="text-[var(--fg-tertiary)]" />
+                              : <Globe size={12} className="text-[var(--fg-tertiary)]" />
+                            }
+                            <span className="text-[11px] font-medium truncate flex-1" style={{ color: 'var(--fg-secondary)' }}>
+                              {proj.name}
+                            </span>
+                            <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-md" style={{ color: 'var(--fg-quaternary)', background: 'var(--tint-subtle)' }}>
+                              {proj.convs.length}
+                            </span>
+                          </button>
+                          {expanded && proj.convs.map((h) => (
+                            <button
+                              key={h.sessionId}
+                              onClick={() => selectHistoryConversation(h)}
+                              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg transition-colors text-left"
+                              style={{
+                                background: activeHistoryId === h.sessionId ? 'var(--accent-subtle)' : 'transparent',
+                                marginLeft: '12px',
+                              }}
+                            >
+                              <div className="flex-1 min-w-0">
+                                <div className="text-[12px] font-medium truncate" style={{ color: 'var(--fg-primary)' }}>
+                                  {h.title}
+                                </div>
+                                <div className="text-[10px] truncate mt-0.5" style={{ color: 'var(--fg-quaternary)' }}>
+                                  {h.lastMessage || `${h.messageCount} messages`}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-1 flex-shrink-0">
+                                {h.entrypoint === 'vscode'
+                                  ? <Terminal size={9} className="text-[var(--fg-quaternary)]" />
+                                  : <Terminal size={9} className="text-[var(--fg-quaternary)]" />
+                                }
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )
+              })()}
             </>
           )}
         </div>
@@ -713,16 +1121,47 @@ export default function App() {
             >
               <PanelLeft size={15} className="text-[var(--fg-tertiary)]" />
             </button>
-            <span className="text-[13px] font-semibold text-[var(--fg-primary)] truncate">{activeConv?.title || 'Claude Code Desktop'}</span>
+            <span className="text-[13px] font-semibold text-[var(--fg-primary)] truncate">
+              {activeHistoryId ? (historyDetail?.title || 'History') : (activeConv?.title || 'Claude Code Desktop')}
+            </span>
           </div>
           <div className="flex items-center gap-2 no-drag flex-shrink-0">
-            {project && (
+            {/* 视图模式切换：Terminal / Chat */}
+            {!activeHistoryId && activeConvId && (
+              <div className="flex items-center gap-0.5 p-0.5 rounded-lg" style={{ background: 'var(--bg-surface-2)' }}>
+                <button
+                  onClick={() => setViewMode('terminal')}
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium transition-all"
+                  style={{
+                    background: viewMode === 'terminal' ? 'var(--accent-subtle)' : 'transparent',
+                    color: viewMode === 'terminal' ? 'var(--accent-bright)' : 'var(--fg-tertiary)',
+                  }}
+                  title="Interactive Claude Code terminal (full CLI capabilities)"
+                >
+                  <Terminal size={12} />
+                  <span>Terminal</span>
+                </button>
+                <button
+                  onClick={() => setViewMode('chat')}
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium transition-all"
+                  style={{
+                    background: viewMode === 'chat' ? 'var(--accent-subtle)' : 'transparent',
+                    color: viewMode === 'chat' ? 'var(--accent-bright)' : 'var(--fg-tertiary)',
+                  }}
+                  title="Structured GUI chat view (stream-json)"
+                >
+                  <MessageCircle size={12} />
+                  <span>Chat</span>
+                </button>
+              </div>
+            )}
+            {(project || (activeHistoryId && historyDetail)) && (
               <div
                 className="flex items-center gap-2 text-[11px] px-2.5 py-1 rounded-lg min-w-0"
                 style={{ color: 'var(--fg-tertiary)', background: 'var(--tint-subtle)', maxWidth: '45vw' }}
               >
                 <FolderOpen size={11} className="flex-shrink-0" />
-                <span className="font-mono truncate">{project.path}</span>
+                <span className="font-mono truncate">{activeHistoryId && historyDetail ? historyDetail.projectPath : project?.path}</span>
               </div>
             )}
             {activeConvId && (
@@ -734,6 +1173,14 @@ export default function App() {
                 <ExternalLink size={14} className="text-[var(--fg-tertiary)]" />
               </button>
             )}
+            <button
+              onClick={() => setRightPanelOpen((v) => !v)}
+              className="w-7 h-7 rounded-lg flex items-center justify-center transition-colors hover:bg-[var(--tint-hover)]"
+              title="Toggle right panel"
+              style={{ background: rightPanelOpen ? 'var(--accent-subtle)' : undefined }}
+            >
+              <PanelRight size={14} className={rightPanelOpen ? 'text-[var(--accent-bright)]' : 'text-[var(--fg-tertiary)]'} />
+            </button>
           </div>
         </header>
 
@@ -761,20 +1208,74 @@ export default function App() {
           </div>
         )}
 
-        <ChatView
-          messages={messages}
-          onSend={handleSend}
-          onStop={handleStop}
-          isStreaming={isStreaming}
-          loading={loadingMsgs}
-          project={project}
-          models={MODELS}
-          selectedModel={selectedModel}
-          onModelSelect={handleModelSelect}
-          onClearChat={confirmClearChat}
-          onNewChat={handleNewChat}
-        />
+        {activeHistoryId && historyDetail ? (
+          <ImportedChatView
+            messages={historyDetail.messages}
+            title={historyDetail.title}
+            projectPath={historyDetail.projectPath}
+            entrypoint={historyDetail.entrypoint}
+          />
+        ) : activeHistoryId && loadingHistory ? (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="flex flex-col items-center gap-3">
+              <Loader2 size={24} className="animate-spin text-[var(--fg-quaternary)]" />
+              <span className="text-[12px] text-[var(--fg-tertiary)]">Loading history…</span>
+            </div>
+          </div>
+        ) : viewMode === 'terminal' && activeConvId ? (
+          <ClaudeTerminalView
+            key={activeConvId}
+            sessionId={activeConvId}
+            cwd={project?.path || newChatProjectPath || '~'}
+            model={selectedModel}
+            resumeSessionId={activeConv?.claudeSessionId}
+            permissionMode={permissionMode}
+            onSessionIdCaptured={(sid) => {
+              // Persist captured claude session ID to the conversation for --resume
+              if (activeConvId && activeConv?.claudeSessionId !== sid) {
+                ipc.invoke('conversation:set-session-id', { id: activeConvId, sessionId: sid }).catch(() => {})
+              }
+              // Start session watcher for structured event extraction
+              if (activeConvId && sid) {
+                const cwdPath = project?.path || newChatProjectPath || '~'
+                ipc.invoke('session-watcher:start', { id: activeConvId, sessionId: sid, cwd: cwdPath }).catch(() => {})
+                setRightPanelOpen(true)
+              }
+            }}
+          />
+        ) : (
+          <ChatView
+            messages={messages}
+            onSend={handleSend}
+            onStop={handleStop}
+            isStreaming={isStreaming}
+            loading={loadingMsgs}
+            project={project}
+            models={models}
+            selectedModel={selectedModel}
+            onModelSelect={handleModelSelect}
+            onClearChat={confirmClearChat}
+            onNewChat={handleNewChat}
+            permissionMode={permissionMode}
+            onPermissionModeChange={setPermissionMode}
+            permissionModes={PERMISSION_MODES}
+            onResendWithPermission={handleResendWithPermission}
+            thinkingEffort={thinkingEffort}
+            onThinkingEffortChange={setThinkingEffort}
+            thinkingEfforts={THINKING_EFFORTS}
+          />
+        )}
       </main>
+
+      {/* Right panel */}
+      {rightPanelOpen && (
+        <RightPanel
+          projectPath={activeHistoryId && historyDetail ? historyDetail.projectPath : (project?.path || null)}
+          onClose={() => setRightPanelOpen(false)}
+          convId={activeConvId}
+          sessionId={activeConv?.claudeSessionId}
+        />
+      )}
 
       {/* Context menu */}
       {contextMenu && contextMenuConv && (

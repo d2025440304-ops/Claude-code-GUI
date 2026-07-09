@@ -13,6 +13,7 @@ export const Channels = {
   CONVERSATION_RENAME: 'conversation:rename',
   CONVERSATION_CLEAR: 'conversation:clear',
   CONVERSATION_SET_MODEL: 'conversation:set-model',
+  CONVERSATION_SET_SESSION_ID: 'conversation:set-session-id',
 
   // Messages — invoke/handle
   MESSAGE_LIST: 'message:list',
@@ -45,6 +46,53 @@ export const Channels = {
 
   // Conversations changed notification (push, main -> renderer)
   CONVERSATIONS_CHANGED: 'conversations:changed',
+
+  // History import (Claude Code 历史对话) — invoke/handle
+  HISTORY_SCAN: 'history:scan',
+  HISTORY_MESSAGES: 'history:messages',
+
+  // Terminal (PTY) — invoke/handle
+  TERMINAL_CREATE: 'terminal:create',
+  TERMINAL_WRITE: 'terminal:write',
+  TERMINAL_RESIZE: 'terminal:resize',
+  TERMINAL_KILL: 'terminal:kill',
+
+  // Terminal output — push (main → renderer)
+  TERMINAL_DATA: 'terminal:data',
+  TERMINAL_EXIT: 'terminal:exit',
+
+  // Claude PTY (交互式 Claude Code 终端) — invoke/handle
+  CLAUDE_PTY_CREATE: 'claude-pty:create',
+  CLAUDE_PTY_WRITE: 'claude-pty:write',
+  CLAUDE_PTY_RESIZE: 'claude-pty:resize',
+  CLAUDE_PTY_KILL: 'claude-pty:kill',
+  CLAUDE_PTY_SEND_TEXT: 'claude-pty:send-text',
+  CLAUDE_PTY_SEND_KEY: 'claude-pty:send-key',
+  CLAUDE_PTY_GET_SESSION_ID: 'claude-pty:get-session-id',
+  CLAUDE_PTY_IS_ACTIVE: 'claude-pty:is-active',
+
+  // Claude PTY output — push (main → renderer)
+  CLAUDE_PTY_DATA: 'claude-pty:data',
+  CLAUDE_PTY_EXIT: 'claude-pty:exit',
+  CLAUDE_PTY_PERMISSION: 'claude-pty:permission',
+
+  // File explorer — invoke/handle
+  FILE_LIST: 'file:list',
+  FILE_READ: 'file:read',
+
+  // Git diff — invoke/handle
+  GIT_DIFF: 'git:diff',
+
+  // 配置读取（~/.claude/settings.json） - invoke/handle
+  CONFIG_READ: 'config:read',
+
+  // Session Watcher (结构化事件提取) — invoke/handle
+  SESSION_WATCHER_START: 'session-watcher:start',
+  SESSION_WATCHER_STOP: 'session-watcher:stop',
+  SESSION_WATCHER_GET_EVENTS: 'session-watcher:get-events',
+
+  // Session Watcher — push (main → renderer)
+  SESSION_EVENT: 'session-event',
 } as const;
 
 export type ChannelName = (typeof Channels)[keyof typeof Channels];
@@ -59,4 +107,10 @@ export const PUSH_CHANNELS: ReadonlySet<string> = new Set([
   Channels.STREAM_ERROR,
   Channels.TYPING,
   Channels.CONVERSATIONS_CHANGED,
+  Channels.TERMINAL_DATA,
+  Channels.TERMINAL_EXIT,
+  Channels.CLAUDE_PTY_DATA,
+  Channels.CLAUDE_PTY_EXIT,
+  Channels.CLAUDE_PTY_PERMISSION,
+  Channels.SESSION_EVENT,
 ]);

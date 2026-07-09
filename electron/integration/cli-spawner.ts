@@ -9,6 +9,10 @@ export interface SendMessageOpts {
   message: string;
   images?: { mimeType: string; data: string }[];
   addDirs?: string[];
+  /** 权限模式：ask | auto-edit | plan | skip */
+  permissionMode?: string;
+  /** 思考等级：none | low | medium | high */
+  thinkingEffort?: string;
 }
 
 export interface ChunkEvent { sessionId: string; chunk: ParsedChunk }
@@ -57,6 +61,34 @@ export class CliSpawner extends EventEmitter {
       args.push('--add-dir', ...opts.addDirs);
     }
 
+    // 权限模式映射到 CLI 参数
+    // 真实取值：acceptEdits | auto | bypassPermissions | default | dontAsk | plan
+    if (opts.permissionMode && opts.permissionMode !== 'ask') {
+      const modeMap: Record<string, string> = {
+        'auto-edit': 'acceptEdits',
+        'plan': 'plan',
+        'skip': 'bypassPermissions',
+      };
+      const cliMode = modeMap[opts.permissionMode];
+      if (cliMode) {
+        args.push('--permission-mode', cliMode);
+      }
+    }
+
+    // 思考等级映射到 CLI 参数
+    // 真实参数是 --effort，取值：low | medium | high | xhigh | max
+    if (opts.thinkingEffort && opts.thinkingEffort !== 'none') {
+      const effortMap: Record<string, string> = {
+        'low': 'low',
+        'medium': 'medium',
+        'high': 'high',
+      };
+      const cliEffort = effortMap[opts.thinkingEffort];
+      if (cliEffort) {
+        args.push('--effort', cliEffort);
+      }
+    }
+
     const child = spawn('claude', args, {
       cwd: opts.cwd,
       shell: false,
@@ -87,17 +119,28 @@ export class CliSpawner extends EventEmitter {
     this.processes.set(sessionId, child);
     this.parsers.set(sessionId, new StreamParser());
 
+    // 收集 stderr 用于错误诊断：进程非零退出且无有效输出时，作为错误信息上报
+    let stderrBuffer = '';
+    let hasReceivedOutput = false;
+
     child.stdout?.on('data', (data: Buffer) => {
       const parser = this.parsers.get(sessionId);
       if (!parser) return;
       const chunks = parser.parse(data.toString());
       for (const chunk of chunks) {
+        // text / thinking / tool_use / tool_result 都算有效输出
+        if ((chunk.type === 'text' || chunk.type === 'thinking' ||
+             chunk.type === 'tool_use' || chunk.type === 'tool_result') && chunk.content) {
+          hasReceivedOutput = true;
+        }
         this.emit('chunk', { sessionId, chunk } as ChunkEvent);
       }
     });
 
     child.stderr?.on('data', (data: Buffer) => {
-      this.emit('stderr', { sessionId, data: data.toString() } as StderrEvent);
+      const text = data.toString();
+      stderrBuffer += text;
+      this.emit('stderr', { sessionId, data: text } as StderrEvent);
     });
 
     child.on('error', (err: NodeJS.ErrnoException) => {
@@ -114,10 +157,23 @@ export class CliSpawner extends EventEmitter {
       if (parser) {
         const remaining = parser.flush();
         for (const chunk of remaining) {
+          if ((chunk.type === 'text' || chunk.type === 'thinking' ||
+               chunk.type === 'tool_use' || chunk.type === 'tool_result') && chunk.content) {
+            hasReceivedOutput = true;
+          }
           this.emit('chunk', { sessionId, chunk } as ChunkEvent);
         }
         parser.clear();
       }
+
+      // 非零退出且未收到任何有效输出 -> 视为错误，提取 stderr 作为诊断信息
+      if (code !== 0 && code !== null && !hasReceivedOutput) {
+        const detail = stderrBuffer.trim()
+          ? stderrBuffer.trim().split('\n').slice(-5).join('\n')
+          : `Claude CLI exited with code ${code} (no output).`;
+        this.emit('error', { sessionId, error: detail } as ErrorEvent);
+      }
+
       this.cleanup(sessionId);
       this.emit('close', { sessionId, exitCode: code } as CloseEvent);
     });

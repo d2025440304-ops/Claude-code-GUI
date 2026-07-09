@@ -17,6 +17,8 @@
 import { app, BrowserWindow, ipcMain, dialog, IpcMainInvokeEvent, clipboard } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
+import { execSync, exec } from 'child_process';
 
 import { Channels } from './ipc/channels';
 import { detectClaudeCli, CliInfo } from './integration/cli-detector';
@@ -31,6 +33,10 @@ import { AppDatabase } from './db/database';
 import { ConversationRepo, Conversation } from './db/repositories/conversation-repo';
 import { MessageRepo, Message, Attachment } from './db/repositories/message-repo';
 import type { ParsedChunk } from './integration/stream-parser';
+import { scanHistorySummaries, loadConversationDetail, HistoryConversation, HistoryConversationDetail } from './integration/history-scanner';
+import { PtyManager } from './integration/pty-manager';
+import { ClaudePtyManager, ClaudePtyPermission } from './integration/claude-pty-manager';
+import { SessionWatcherManager, SessionEvent } from './integration/session-watcher';
 
 // ---------------------------------------------------------------------------
 // Constants & module state
@@ -61,6 +67,9 @@ let conversationRepo: ConversationRepo;
 let messageRepo: MessageRepo;
 
 const cliSpawner = new CliSpawner();
+const ptyManager = new PtyManager();
+const claudePtyManager = new ClaudePtyManager();
+const sessionWatcherManager = new SessionWatcherManager();
 
 /** Cached CLI detection result (refreshed on each `cli:check` call). */
 let cliInfo: CliInfo | null = null;
@@ -128,6 +137,62 @@ const MIME_BY_EXT: Record<string, string> = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
   webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', tiff: 'image/tiff',
 };
+
+/** 解析 git diff --name-status 输出并获取每个文件的 diff */
+function parseDiffFiles(
+  statusOutput: string,
+  cwd: string,
+  staged: boolean,
+): { ok: boolean; files: any[] } {
+  const files: any[] = [];
+  const lines = statusOutput.split('\n').filter(l => l.trim());
+
+  for (const line of lines) {
+    const parts = line.split('\t');
+    if (parts.length < 2) continue;
+
+    const statusCode = parts[0];
+    const filePath = parts[parts.length - 1];
+
+    let status: 'added' | 'modified' | 'deleted' | 'renamed' = 'modified';
+    if (statusCode === 'A') status = 'added';
+    else if (statusCode === 'D') status = 'deleted';
+    else if (statusCode.startsWith('R')) status = 'renamed';
+
+    try {
+      const diffCmd = staged
+        ? `git diff --cached -- "${filePath}"`
+        : `git diff HEAD -- "${filePath}"`;
+      const diff = execSync(diffCmd, {
+        cwd,
+        encoding: 'utf-8',
+        maxBuffer: 512 * 1024,
+      });
+
+      // 统计增删行数
+      const diffLines = diff.split('\n');
+      let additions = 0;
+      let deletions = 0;
+      for (const dl of diffLines) {
+        if (dl.startsWith('+') && !dl.startsWith('+++')) additions++;
+        else if (dl.startsWith('-') && !dl.startsWith('---')) deletions++;
+      }
+
+      files.push({
+        path: filePath,
+        status,
+        additions,
+        deletions,
+        diff: diff.slice(0, 10000), // 限制 diff 大小
+      });
+    } catch {
+      // 获取 diff 失败，仍然列出文件
+      files.push({ path: filePath, status, additions: 0, deletions: 0, diff: '' });
+    }
+  }
+
+  return { ok: true, files };
+}
 
 /** Read an image file and return its base64 data URL. */
 function readFileAsDataUrl(filePath: string): { dataUrl: string; mimeType: string } | null {
@@ -363,6 +428,10 @@ interface MessageSendPayload {
   conversationId: string;
   message: string;
   attachments?: Attachment[];
+  /** 权限模式：ask | auto-edit | plan | skip */
+  permissionMode?: string;
+  /** 思考等级：none | low | medium | high */
+  thinkingEffort?: string;
 }
 
 interface StopGenerationPayload {
@@ -395,6 +464,10 @@ function registerIpcHandlers(): void {
     (_e: IpcMainInvokeEvent, payload: ConversationIdPayload): { ok: boolean } => {
       // 清理全局状态，避免内存泄漏
       clearSessionState(payload.id);
+      // 同时清理 Claude PTY 会话
+      claudePtyManager.kill(payload.id);
+      // 停止 session watcher
+      sessionWatcherManager.stop(payload.id);
       conversationRepo.delete(payload.id);
       broadcast(Channels.CONVERSATIONS_CHANGED);
       return { ok: true };
@@ -446,6 +519,23 @@ function registerIpcHandlers(): void {
     },
   );
 
+  ipcMain.handle(
+    Channels.CONVERSATION_SET_SESSION_ID,
+    (_e: IpcMainInvokeEvent, payload: { id: string; sessionId: string }): { ok: boolean } => {
+      try {
+        const conv = conversationRepo.getById(payload.id);
+        if (conv) {
+          conversationRepo.updateLastMessage(payload.id, conv.lastMessage ?? '', payload.sessionId);
+          broadcast(Channels.CONVERSATIONS_CHANGED);
+        }
+        return { ok: true };
+      } catch (err) {
+        console.error('[Main] Failed to set session id:', err);
+        return { ok: false };
+      }
+    },
+  );
+
   // -- Messages -------------------------------------------------------------
 
   ipcMain.handle(
@@ -467,7 +557,7 @@ function registerIpcHandlers(): void {
       _e: IpcMainInvokeEvent,
       payload: MessageSendPayload,
     ): Promise<{ ok: boolean; error?: string; userMessage?: Message }> => {
-      const { conversationId, message, attachments } = payload;
+      const { conversationId, message, attachments, permissionMode, thinkingEffort } = payload;
       const atts = attachments ?? [];
 
       if ((!message || !message.trim()) && atts.length === 0) {
@@ -524,6 +614,8 @@ function registerIpcHandlers(): void {
           message: prompt,
           images: images.length > 0 ? images : undefined,
           addDirs: addDirs.length > 0 ? addDirs : undefined,
+          permissionMode: permissionMode || undefined,
+          thinkingEffort: thinkingEffort || undefined,
         });
       } catch (err) {
         clearSessionState(conversationId);
@@ -674,6 +766,546 @@ function registerIpcHandlers(): void {
       }
     },
   );
+
+  // -- History import (Claude Code 历史对话) ---------------------------------
+
+  ipcMain.handle(Channels.HISTORY_SCAN, (): HistoryConversation[] => {
+    try {
+      return scanHistorySummaries();
+    } catch (err) {
+      console.error('[Main] Failed to scan history:', err);
+      return [];
+    }
+  });
+
+  ipcMain.handle(
+    Channels.HISTORY_MESSAGES,
+    (_e: IpcMainInvokeEvent, payload: { projectPath: string; sessionId: string }): HistoryConversationDetail | null => {
+      try {
+        return loadConversationDetail(payload.projectPath, payload.sessionId);
+      } catch (err) {
+        console.error('[Main] Failed to load history messages:', err);
+        return null;
+      }
+    },
+  );
+
+  // -- Terminal (PTY) ---------------------------------------------------------
+
+  ipcMain.handle(
+    Channels.TERMINAL_CREATE,
+    (e: IpcMainInvokeEvent, payload: { id: string; cwd?: string }): { ok: boolean; error?: string } => {
+      console.log(`[Main] Creating terminal ${payload.id} in ${payload.cwd || 'default'}`);
+      const result = ptyManager.create(payload.id, payload.cwd);
+      console.log(`[Main] Terminal create result:`, result);
+      if (result.ok) {
+        // 注册输出回调，推送到渲染进程
+        ptyManager.onData(payload.id, (data: string) => {
+          const win = BrowserWindow.fromWebContents(e.sender);
+          if (win && !win.isDestroyed()) {
+            win.webContents.send(Channels.TERMINAL_DATA, { id: payload.id, data });
+          }
+        });
+        // 注册退出回调
+        ptyManager.onExit(payload.id, (exitCode: number) => {
+          const win = BrowserWindow.fromWebContents(e.sender);
+          if (win && !win.isDestroyed()) {
+            win.webContents.send(Channels.TERMINAL_EXIT, { id: payload.id, exitCode });
+          }
+        });
+      }
+      return result;
+    },
+  );
+
+  ipcMain.handle(
+    Channels.TERMINAL_WRITE,
+    (_e: IpcMainInvokeEvent, payload: { id: string; data: string }): void => {
+      console.log(`[Main] Terminal write to ${payload.id}: ${JSON.stringify(payload.data)}`);
+      ptyManager.write(payload.id, payload.data);
+    },
+  );
+
+  ipcMain.handle(
+    Channels.TERMINAL_RESIZE,
+    (_e: IpcMainInvokeEvent, payload: { id: string; cols: number; rows: number }): void => {
+      ptyManager.resize(payload.id, payload.cols, payload.rows);
+    },
+  );
+
+  ipcMain.handle(
+    Channels.TERMINAL_KILL,
+    (_e: IpcMainInvokeEvent, payload: { id: string }): void => {
+      ptyManager.kill(payload.id);
+    },
+  );
+
+  // -- Claude PTY (交互式 Claude Code 终端) -----------------------------------
+
+  ipcMain.handle(
+    Channels.CLAUDE_PTY_CREATE,
+    (e: IpcMainInvokeEvent, payload: {
+      id: string;
+      cwd: string;
+      model?: string;
+      resumeSessionId?: string;
+      permissionMode?: string;
+      addDirs?: string[];
+    }): { ok: boolean; error?: string } => {
+      const { id, cwd, model, resumeSessionId, permissionMode, addDirs } = payload;
+
+      // 权限模式映射
+      const modeMap: Record<string, string> = {
+        'ask': 'default',
+        'auto-edit': 'acceptEdits',
+        'plan': 'plan',
+        'skip': 'bypassPermissions',
+      };
+      const cliPermissionMode = permissionMode ? modeMap[permissionMode] || undefined : undefined;
+
+      const result = claudePtyManager.create(id, {
+        cwd,
+        model: model && model !== 'default' ? model : undefined,
+        resumeSessionId,
+        permissionMode: cliPermissionMode,
+        addDirs,
+      });
+
+      if (result.ok) {
+        // 注册输出回调，推送到渲染进程
+        claudePtyManager.onData(id, (data: string) => {
+          // 发送到所有绑定此会话的窗口
+          for (const [winId, convId] of windowBindings) {
+            if (convId !== id) continue;
+            const win = BrowserWindow.fromId(winId);
+            if (!win || win.isDestroyed()) continue;
+            const contents = win.webContents;
+            if (!contents || contents.isDestroyed()) continue;
+            contents.send(Channels.CLAUDE_PTY_DATA, { id, data });
+          }
+          // 也发送到触发创建的窗口（可能还未绑定）
+          const senderWin = BrowserWindow.fromWebContents(e.sender);
+          if (senderWin && !senderWin.isDestroyed()) {
+            const contents = senderWin.webContents;
+            if (contents && !contents.isDestroyed()) {
+              // 避免重复发送（如果已绑定则上面已发送）
+              let alreadySent = false;
+              for (const [winId, convId] of windowBindings) {
+                if (convId === id && winId === senderWin.id) { alreadySent = true; break; }
+              }
+              if (!alreadySent) {
+                contents.send(Channels.CLAUDE_PTY_DATA, { id, data });
+              }
+            }
+          }
+        });
+
+        // 注册权限提示回调，推送到渲染进程
+        claudePtyManager.onPermission(id, (permission: ClaudePtyPermission) => {
+          for (const [winId, convId] of windowBindings) {
+            if (convId !== id) continue;
+            const win = BrowserWindow.fromId(winId);
+            if (!win || win.isDestroyed()) continue;
+            const contents = win.webContents;
+            if (!contents || contents.isDestroyed()) continue;
+            contents.send(Channels.CLAUDE_PTY_PERMISSION, permission);
+          }
+          const senderWin = BrowserWindow.fromWebContents(e.sender);
+          if (senderWin && !senderWin.isDestroyed()) {
+            const contents = senderWin.webContents;
+            if (contents && !contents.isDestroyed()) {
+              let alreadySent = false;
+              for (const [winId, convId] of windowBindings) {
+                if (convId === id && winId === senderWin.id) { alreadySent = true; break; }
+              }
+              if (!alreadySent) {
+                contents.send(Channels.CLAUDE_PTY_PERMISSION, permission);
+              }
+            }
+          }
+        });
+
+        // 注册退出回调
+        claudePtyManager.onExit(id, (exitCode: number) => {
+          // 停止 session watcher（spec: CLAUDE_PTY_EXIT handler 中自动停止对应 watcher）
+          sessionWatcherManager.stop(id);
+
+          for (const [winId, convId] of windowBindings) {
+            if (convId !== id) continue;
+            const win = BrowserWindow.fromId(winId);
+            if (!win || win.isDestroyed()) continue;
+            const contents = win.webContents;
+            if (!contents || contents.isDestroyed()) continue;
+            contents.send(Channels.CLAUDE_PTY_EXIT, { id, exitCode });
+          }
+          const senderWin = BrowserWindow.fromWebContents(e.sender);
+          if (senderWin && !senderWin.isDestroyed()) {
+            const contents = senderWin.webContents;
+            if (contents && !contents.isDestroyed()) {
+              let alreadySent = false;
+              for (const [winId, convId] of windowBindings) {
+                if (convId === id && winId === senderWin.id) { alreadySent = true; break; }
+              }
+              if (!alreadySent) {
+                contents.send(Channels.CLAUDE_PTY_EXIT, { id, exitCode });
+              }
+            }
+          }
+        });
+      }
+      return result;
+    },
+  );
+
+  ipcMain.handle(
+    Channels.CLAUDE_PTY_WRITE,
+    (_e: IpcMainInvokeEvent, payload: { id: string; data: string }): void => {
+      claudePtyManager.write(payload.id, payload.data);
+    },
+  );
+
+  ipcMain.handle(
+    Channels.CLAUDE_PTY_RESIZE,
+    (_e: IpcMainInvokeEvent, payload: { id: string; cols: number; rows: number }): void => {
+      claudePtyManager.resize(payload.id, payload.cols, payload.rows);
+    },
+  );
+
+  ipcMain.handle(
+    Channels.CLAUDE_PTY_KILL,
+    (_e: IpcMainInvokeEvent, payload: { id: string }): void => {
+      claudePtyManager.kill(payload.id);
+    },
+  );
+
+  /** 发送文本到 Claude PTY（自动追加换行符，模拟用户回车） */
+  ipcMain.handle(
+    Channels.CLAUDE_PTY_SEND_TEXT,
+    (_e: IpcMainInvokeEvent, payload: { id: string; text: string }): void => {
+      const text = payload.text;
+      // 如果文本以 / 开头（斜杠命令），直接发送 + 回车
+      // 否则也直接发送 + 回车
+      claudePtyManager.write(payload.id, text + '\r');
+    },
+  );
+
+  /** 发送特殊按键到 Claude PTY（如 Ctrl+C, Ctrl+D, Escape 等） */
+  ipcMain.handle(
+    Channels.CLAUDE_PTY_SEND_KEY,
+    (_e: IpcMainInvokeEvent, payload: { id: string; key: string }): void => {
+      const keyMap: Record<string, string> = {
+        'ctrl-c': '\x03',
+        'ctrl-d': '\x04',
+        'ctrl-z': '\x1a',
+        'ctrl-l': '\x0c',
+        'ctrl-a': '\x01',
+        'ctrl-e': '\x05',
+        'ctrl-k': '\x0b',
+        'ctrl-u': '\x15',
+        'ctrl-w': '\x17',
+        'escape': '\x1b',
+        'enter': '\r',
+        'tab': '\t',
+        'up': '\x1b[A',
+        'down': '\x1b[B',
+        'right': '\x1b[C',
+        'left': '\x1b[D',
+      };
+      const seq = keyMap[payload.key];
+      if (seq) {
+        claudePtyManager.write(payload.id, seq);
+      }
+    },
+  );
+
+  /**
+   * 扫描 ~/.claude/projects/<encoded-cwd>/ 目录下最新的 session 文件，
+   * 返回 session ID（文件名，不含扩展名）。
+   * 用于在 Terminal 模式下捕获 claude 交互式会话的 ID，以便 --resume。
+   */
+  ipcMain.handle(
+    Channels.CLAUDE_PTY_GET_SESSION_ID,
+    (_e: IpcMainInvokeEvent, payload: { cwd: string }): { sessionId: string | null } => {
+      try {
+        const claudeDir = path.join(os.homedir(), '.claude', 'projects');
+        if (!fs.existsSync(claudeDir)) return { sessionId: null };
+
+        // Claude Code 编码项目路径：将 / 替换为 -，移除开头的 -
+        const encodedCwd = payload.cwd.replace(/\//g, '-').replace(/^-+/, '');
+        const projectDir = path.join(claudeDir, encodedCwd);
+
+        if (!fs.existsSync(projectDir)) return { sessionId: null };
+
+        // 查找最新的 .jsonl 文件
+        const files = fs.readdirSync(projectDir)
+          .filter(f => f.endsWith('.jsonl'))
+          .map(f => {
+            const fullPath = path.join(projectDir, f);
+            const stat = fs.statSync(fullPath);
+            return { name: f, mtime: stat.mtime.getTime() };
+          })
+          .sort((a, b) => b.mtime - a.mtime);
+
+        if (files.length === 0) return { sessionId: null };
+
+        // 返回最新的 session ID（去掉 .jsonl 扩展名）
+        const sessionId = files[0].name.replace(/\.jsonl$/, '');
+        return { sessionId };
+      } catch (err) {
+        console.error('[Main] Failed to get session ID:', err);
+        return { sessionId: null };
+      }
+    },
+  );
+
+  // -- File explorer ----------------------------------------------------------
+
+  /** 检查 Claude PTY 是否活跃 */
+  ipcMain.handle(
+    Channels.CLAUDE_PTY_IS_ACTIVE,
+    (_e: IpcMainInvokeEvent, payload: { id: string }): { active: boolean } => {
+      return { active: claudePtyManager.isActive(payload.id) };
+    },
+  );
+
+  // -- Session Watcher (结构化事件提取) ---------------------------------------
+
+  /** 启动 session 文件监听 */
+  ipcMain.handle(
+    Channels.SESSION_WATCHER_START,
+    (e: IpcMainInvokeEvent, payload: {
+      id: string;
+      sessionId: string;
+      cwd: string;
+    }): { ok: boolean } => {
+      const { id, sessionId, cwd } = payload;
+      sessionWatcherManager.start(id, sessionId, cwd, (event: SessionEvent) => {
+        // 发送到所有绑定此会话的窗口
+        for (const [winId, convId] of windowBindings) {
+          if (convId !== id) continue;
+          const win = BrowserWindow.fromId(winId);
+          if (!win || win.isDestroyed()) continue;
+          const contents = win.webContents;
+          if (!contents || contents.isDestroyed()) continue;
+          contents.send(Channels.SESSION_EVENT, { id, event });
+        }
+        // 也发送到触发创建的窗口
+        const senderWin = BrowserWindow.fromWebContents(e.sender);
+        if (senderWin && !senderWin.isDestroyed()) {
+          const contents = senderWin.webContents;
+          if (contents && !contents.isDestroyed()) {
+            let alreadySent = false;
+            for (const [winId, convId] of windowBindings) {
+              if (convId === id && winId === senderWin.id) { alreadySent = true; break; }
+            }
+            if (!alreadySent) {
+              contents.send(Channels.SESSION_EVENT, { id, event });
+            }
+          }
+        }
+      });
+      return { ok: true };
+    },
+  );
+
+  /** 停止 session 文件监听 */
+  ipcMain.handle(
+    Channels.SESSION_WATCHER_STOP,
+    (_e: IpcMainInvokeEvent, payload: { id: string }): void => {
+      sessionWatcherManager.stop(payload.id);
+    },
+  );
+
+  /** 获取已解析的全部事件（用于面板初始化时回放） */
+  ipcMain.handle(
+    Channels.SESSION_WATCHER_GET_EVENTS,
+    (_e: IpcMainInvokeEvent, payload: { id: string }): { events: SessionEvent[] } => {
+      return { events: sessionWatcherManager.getEvents(payload.id) };
+    },
+  );
+
+  // -- File explorer
+
+  ipcMain.handle(
+    Channels.FILE_LIST,
+    (_e: IpcMainInvokeEvent, payload: { dirPath: string }): { name: string; path: string; isDirectory: boolean; extension?: string }[] => {
+      try {
+        const entries = fs.readdirSync(payload.dirPath, { withFileTypes: true });
+        // 过滤隐藏文件和 node_modules，排序：目录在前，文件在后
+        const filtered = entries
+          .filter(e => !e.name.startsWith('.') && e.name !== 'node_modules' && e.name !== '__pycache__')
+          .map(e => ({
+            name: e.name,
+            path: path.join(payload.dirPath, e.name),
+            isDirectory: e.isDirectory(),
+            extension: e.isDirectory() ? undefined : path.extname(e.name).slice(1),
+          }));
+        filtered.sort((a, b) => {
+          if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        });
+        return filtered;
+      } catch (err) {
+        console.error('[Main] Failed to list directory:', err);
+        return [];
+      }
+    },
+  );
+
+  ipcMain.handle(
+    Channels.FILE_READ,
+    (_e: IpcMainInvokeEvent, payload: { filePath: string }): { ok: boolean; content?: string; error?: string } => {
+      try {
+        const stat = fs.statSync(payload.filePath);
+        // 限制文件大小（最大 500KB）
+        if (stat.size > 500 * 1024) {
+          return { ok: false, error: 'File too large (>500KB)' };
+        }
+        const content = fs.readFileSync(payload.filePath, 'utf-8');
+        return { ok: true, content };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+    },
+  );
+
+  // -- Git diff ---------------------------------------------------------------
+
+  ipcMain.handle(
+    Channels.GIT_DIFF,
+    (_e: IpcMainInvokeEvent, payload: { dirPath: string }): { ok: boolean; files?: any[]; error?: string } => {
+      try {
+        // 检查是否是 git 仓库
+        try {
+          execSync('git rev-parse --is-inside-work-tree', { cwd: payload.dirPath, stdio: 'pipe' });
+        } catch {
+          return { ok: false, error: 'Not a git repository' };
+        }
+
+        // 获取变更文件列表
+        const statusOutput = execSync('git diff --name-status HEAD', {
+          cwd: payload.dirPath,
+          encoding: 'utf-8',
+          maxBuffer: 1024 * 1024,
+        }).trim();
+
+        if (!statusOutput) {
+          // 也检查暂存区
+          const stagedOutput = execSync('git diff --cached --name-status', {
+            cwd: payload.dirPath,
+            encoding: 'utf-8',
+            maxBuffer: 1024 * 1024,
+          }).trim();
+          if (!stagedOutput) return { ok: true, files: [] };
+
+          return parseDiffFiles(stagedOutput, payload.dirPath, true);
+        }
+
+        return parseDiffFiles(statusOutput, payload.dirPath, false);
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+    },
+  );
+
+  // -- 配置读取（cc-switch 集成） --------------------------------------------
+
+  ipcMain.handle(Channels.CONFIG_READ, (): ConfigReadResult => {
+    return readClaudeSettings();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// cc-switch 配置解析
+// ---------------------------------------------------------------------------
+
+interface ModelConfig {
+  id: string;
+  name: string;
+  desc: string;
+}
+
+interface ConfigReadResult {
+  models: ModelConfig[];
+  defaultModel: string;
+  effortLevel: string;
+  /** cc-switch 配置的当前默认别名（opus/sonnet/haiku），用于 Default 选项的描述 */
+  currentAlias: string;
+}
+
+/**
+ * 读取 ~/.claude/settings.json，解析 cc-switch 配置的模型映射。
+ *
+ * cc-switch 通过环境变量把 opus/sonnet/haiku 别名映射到真实模型：
+ *   env.ANTHROPIC_DEFAULT_OPUS_MODEL   = "kimi-k2.7-code"
+ *   env.ANTHROPIC_DEFAULT_SONNET_MODEL = "doubao-seed-2.0-pro"
+ *   env.ANTHROPIC_DEFAULT_HAIKU_MODEL  = "glm-5.2"
+ *   model = "haiku"  (当前默认别名)
+ *   effortLevel = "medium"
+ *
+ * 前端据此动态生成模型列表，显示真实模型名而非硬编码的 "Opus 4" 等。
+ */
+function readClaudeSettings(): ConfigReadResult {
+  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+  let settings: Record<string, unknown> = {};
+  try {
+    const raw = fs.readFileSync(settingsPath, 'utf-8');
+    settings = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    // 文件不存在或解析失败：返回仅含 Default 的兜底列表
+  }
+
+  const env = (settings.env as Record<string, string>) || {};
+
+  // 别名 -> 真实模型名（优先 _MODEL，回退 _MODEL_NAME）
+  const aliasMap: Record<string, string> = {
+    opus: env.ANTHROPIC_DEFAULT_OPUS_MODEL || env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME || '',
+    sonnet: env.ANTHROPIC_DEFAULT_SONNET_MODEL || env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME || '',
+    haiku: env.ANTHROPIC_DEFAULT_HAIKU_MODEL || env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME || '',
+  };
+
+  const currentAlias = (settings.model as string) || 'sonnet';
+  const defaultReal = aliasMap[currentAlias] || '';
+
+  const models: ModelConfig[] = [];
+
+  // Default 选项 - 不传 --model，走 cc-switch 配置
+  models.push({
+    id: 'default',
+    name: 'Default',
+    desc: defaultReal
+      ? `cc-switch · ${currentAlias} → ${defaultReal}`
+      : 'cc-switch configured model',
+  });
+
+  // 各别名选项 - 显示真实模型名
+  const aliasLabels: Record<string, string> = {
+    opus: 'Opus',
+    sonnet: 'Sonnet',
+    haiku: 'Haiku',
+  };
+  for (const alias of ['opus', 'sonnet', 'haiku']) {
+    const real = aliasMap[alias];
+    if (real) {
+      models.push({
+        id: alias,
+        name: aliasLabels[alias],
+        desc: real,
+      });
+    }
+  }
+
+  // 如果一个别名都没配置，至少保证有 default + 一个兜底选项
+  if (models.length === 1) {
+    models.push({ id: 'sonnet', name: 'Sonnet', desc: 'Claude Sonnet (default)' });
+  }
+
+  return {
+    models,
+    defaultModel: 'default',
+    effortLevel: (settings.effortLevel as string) || 'medium',
+    currentAlias,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -721,5 +1353,8 @@ app.on('before-quit', () => {
   // Persist any in-flight assistant responses before shutting down.
   flushAllPending();
   cliSpawner.stopAll();
+  ptyManager.killAll();
+  claudePtyManager.killAll();
+  sessionWatcherManager.stopAll();
   database.close();
 });
