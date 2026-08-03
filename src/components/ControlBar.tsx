@@ -114,13 +114,15 @@ function PortalPopup({
       style={{
         position: 'fixed',
         bottom: `calc(100vh - ${pos.top}px + 8px)`,
-        left: pos.left,
+        left: Math.max(8, Math.min(pos.left, window.innerWidth - minWidth - 12)),
         minWidth,
+        maxHeight: Math.max(160, pos.top - 16),
         background: 'var(--bg-surface)',
         border: '1px solid var(--border-default)',
         boxShadow: 'var(--shadow-lg)',
         borderRadius: '16px',
-        overflow: 'hidden',
+        overflowX: 'hidden',
+        overflowY: 'auto',
         zIndex: 9999,
       }}
     >

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Plus, Search, Pin, FolderOpen, Settings, ChevronDown, Sparkles, Edit3, Loader2, Trash2, X, MessageSquare, Hash, Sun, Moon, PanelLeft, ExternalLink, History, Terminal, Globe, PanelRight, MessageCircle } from 'lucide-react'
+import { Plus, Search, Pin, FolderOpen, Settings, ChevronDown, Sparkles, Edit3, Loader2, Trash2, X, MessageSquare, Hash, Sun, Moon, PanelLeft, ExternalLink, History, Terminal, Globe, PanelRight, MessageCircle, Key, Eye, EyeOff, Check, Shield } from 'lucide-react'
 import ChatView from './components/ChatView'
-import ClaudeTerminalView from './components/ClaudeTerminalView'
+import AgentConversationView from './components/AgentConversationView'
 import ImportedChatView from './components/ImportedChatView'
 import RightPanel from './components/RightPanel'
 import ConversationItem from './components/ConversationItem'
@@ -9,6 +9,9 @@ import ModelSelector from './components/ModelSelector'
 import ProjectSelector from './components/ProjectSelector'
 import ConfirmDialog from './components/ConfirmDialog'
 import { ipc } from './lib/ipc'
+import type { StreamChunk, StreamChunkPayload, StreamEndPayload, StreamErrorPayload } from './lib/ipc'
+import type { StreamState, StreamMachineEvent } from './lib/streamMachine'
+import { reduce as reduceStreamState, isStreamActive } from './lib/streamMachine'
 import type { Conversation, Message, Attachment, HistoryConversation, HistoryConversationDetail, PermissionMode, ThinkingEffort, ModelOption, ContentBlock } from './types'
 import { MODELS, PERMISSION_MODES, THINKING_EFFORTS } from './types'
 
@@ -24,22 +27,6 @@ function getProjectName(path: string | null): string | null {
 function safeParseJSON(s?: string): Record<string, unknown> | undefined {
   if (!s) return undefined
   try { return JSON.parse(s) as Record<string, unknown> } catch { return undefined }
-}
-
-/** 流式 chunk 类型（与后端 ParsedChunk 对齐） */
-interface StreamChunk {
-  type: string
-  content?: string
-  tool?: string
-  input?: string
-  toolUseId?: string
-  stdout?: string
-  stderr?: string
-  isError?: boolean
-  diff?: Array<{ oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }>
-  filePath?: string
-  error?: string
-  blockStart?: boolean
 }
 
 /**
@@ -124,6 +111,65 @@ function applyChunkToBlocks(blocks: ContentBlock[], chunk: StreamChunk): Content
   return next
 }
 
+/**
+ * 如果 content 是 JSON 数组（结构化 parts），提取其中 text 部分拼接为纯文本。
+ * 用于 HistoryMessage 等不需要 contentBlocks 的场景。
+ */
+function plainifyJSONContent<T extends { role: string; content: string }>(msg: T): T {
+  if (msg.role !== 'assistant' || !msg.content) return msg
+  try {
+    const v = JSON.parse(msg.content)
+    if (Array.isArray(v) && v.length > 0 && v[0] && typeof v[0] === 'object' && 'type' in v[0]) {
+      const text = v.filter((p: Record<string, unknown>) => p.type === 'text' && p.text).map((p: Record<string, unknown>) => p.text as string).join('')
+      if (text) return { ...msg, content: text }
+    }
+  } catch {}
+  return msg
+}
+
+/**
+ * Parse assistant messages whose `content` field contains a JSON-serialized
+ * array of structured parts (text / thinking / tool_use / tool_result) back
+ * into `contentBlocks` so that ChatView can render them with proper formatting
+ * (markdown, code highlighting, tool cards) instead of raw JSON.
+ */
+function deserializeMessageBlocks(msg: Message): Message {
+  if (msg.role !== 'assistant' || !msg.content || msg.contentBlocks?.length) return msg
+  let parsed: Array<Record<string, unknown>> | null = null
+  try {
+    const v = JSON.parse(msg.content)
+    if (Array.isArray(v) && v.length > 0 && v[0] && typeof v[0] === 'object' && 'type' in v[0]) parsed = v
+  } catch { return msg }
+  if (!parsed) return msg
+  const blocks: ContentBlock[] = []
+  let i = 0
+  for (const p of parsed) {
+    const t = p.type as string
+    if (t === 'text' && p.text) {
+      blocks.push({ id: `db-${i}`, type: 'text', content: p.text as string, status: 'completed' })
+    } else if (t === 'thinking' && p.text) {
+      blocks.push({ id: `db-${i}`, type: 'thinking', content: p.text as string, status: 'completed' })
+    } else if (t === 'tool_use') {
+      blocks.push({
+        id: `db-${i}`, type: 'tool_use', toolName: p.toolName as string,
+        toolUseId: p.toolUseId as string, toolInput: p.input as Record<string, unknown> | undefined,
+        status: 'completed',
+      })
+    } else if (t === 'tool_result') {
+      const idx = blocks.findIndex(b => b.toolUseId === p.toolUseId && b.type === 'tool_use')
+      if (idx >= 0) {
+        blocks[idx] = { ...blocks[idx], content: p.content as string, isError: !!p.isError, status: (p.isError ? 'error' : 'completed') }
+      } else {
+        blocks.push({ id: `db-${i}`, type: 'tool_result', toolUseId: p.toolUseId as string, content: p.content as string, isError: !!p.isError, status: 'completed' })
+      }
+    }
+    i++
+  }
+  // Derive a plain-text content from blocks for fallback / preview.
+  const textContent = blocks.filter(b => b.type === 'text').map(b => b.content || '').join('')
+  return { ...msg, contentBlocks: blocks, content: textContent || msg.content }
+}
+
 /* ---------- App ---------- */
 
 export default function App() {
@@ -140,7 +186,11 @@ export default function App() {
   const [models, setModels] = useState<ModelOption[]>(MODELS)
   const [searchQuery, setSearchQuery] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
-  const [isStreaming, setIsStreaming] = useState(false)
+  const [streamState, setStreamState] = useState<StreamState>('IDLE')
+  const dispatchStream = useCallback((ev: StreamMachineEvent) => {
+    setStreamState((s) => reduceStreamState(s, ev))
+  }, [])
+  const isStreaming = isStreamActive(streamState)
   const [loadingConvs, setLoadingConvs] = useState(true)
   const [loadingMsgs, setLoadingMsgs] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -170,9 +220,9 @@ export default function App() {
   const [rightPanelOpen, setRightPanelOpen] = useState<boolean>(() => {
     try { return localStorage.getItem('ccd:rightPanel') === '1' } catch { return false }
   })
-  // 视图模式：terminal = 交互式 Claude Code 终端；chat = 结构化 GUI 聊天
-  const [viewMode, setViewMode] = useState<'terminal' | 'chat'>(() => {
-    try { return (localStorage.getItem('ccd:viewMode') as 'terminal' | 'chat') || 'terminal' } catch { return 'terminal' }
+  // 视图模式：agent = SDK 纯 GUI；chat = 结构化 GUI 聊天
+  const [viewMode, setViewMode] = useState<'agent' | 'chat'>(() => {
+    try { return (localStorage.getItem('ccd:viewMode') as 'agent' | 'chat') || 'agent' } catch { return 'agent' }
   })
   // 拖拽状态
   const isDraggingSidebarRef = useRef(false)
@@ -180,6 +230,21 @@ export default function App() {
   const [cliInfo, setCliInfo] = useState<{ installed: boolean; version: string | null; error?: string } | null>(null)
   // 设置面板开关
   const [showSettings, setShowSettings] = useState(false)
+  // API Key 状态
+  const [apiKey, setApiKey] = useState('')
+  const [apiKeySaved, setApiKeySaved] = useState(false)
+  const [apiKeyVisible, setApiKeyVisible] = useState(false)
+
+  // Load API key on mount
+  useEffect(() => {
+    ipc.invoke<{ value: unknown }>('settings:get', { key: 'apiKey' })
+      .then(res => {
+        if (res?.value && typeof res.value === 'string') {
+          setApiKey(res.value)
+        }
+      })
+      .catch(() => {})
+  }, [])
   // 权限模式
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => {
     try { return (localStorage.getItem('ccd:perm') as PermissionMode) || 'ask' } catch { return 'ask' }
@@ -205,10 +270,23 @@ export default function App() {
 
   const activeConvIdRef = useRef<string | null>(null)
   useEffect(() => { activeConvIdRef.current = activeConvId }, [activeConvId])
+
   const isStreamingRef = useRef(isStreaming)
   isStreamingRef.current = isStreaming
+  const streamStateRef = useRef(streamState)
+  streamStateRef.current = streamState
+  const streamAbortRef = useRef<AbortController | null>(null)
+  // Gracefully halt the active stream (New Chat / Stop / context switch).
+  const abortActiveStream = useCallback(() => {
+    if (!isStreamActive(streamStateRef.current)) return
+    const prevId = activeConvIdRef.current
+    streamAbortRef.current?.abort()
+    streamAbortRef.current = null
+    if (prevId) ipc.invoke('stop:generation', { conversationId: prevId }).catch(() => {})
+    dispatchStream({ type: 'STOPPED' })
+  }, [dispatchStream])
 
-  // Apply + persist theme on <html>.
+ // Apply + persist theme on <html>.
   useEffect(() => {
     const root = document.documentElement
     if (theme === 'light') root.setAttribute('data-theme', 'light')
@@ -280,15 +358,19 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem('ccd:sidebar', sidebarCollapsed ? '1' : '0') } catch {} }, [sidebarCollapsed])
   useEffect(() => { try { localStorage.setItem('ccd:sidebarWidth', String(sidebarWidth)) } catch {} }, [sidebarWidth])
   useEffect(() => { try { localStorage.setItem('ccd:rightPanel', rightPanelOpen ? '1' : '0') } catch {} }, [rightPanelOpen])
-  useEffect(() => { try { localStorage.setItem('ccd:viewMode', viewMode) } catch {} }, [viewMode])
-  useEffect(() => { try { localStorage.setItem('ccd:perm', permissionMode) } catch {} }, [permissionMode])
+ useEffect(() => { try { localStorage.setItem('ccd:viewMode', viewMode) } catch {} }, [viewMode])
+  // Note: viewMode is intentionally NOT auto-switched when selecting conversations.
+  // The user freely toggles between Agent and Chat mode via the toolbar buttons.
+  // Both modes read/write the same conversation's messages from SQLite, so history
+  // is always shared regardless of which mode was used to send a message.
+ useEffect(() => { try { localStorage.setItem('ccd:perm', permissionMode) } catch {} }, [permissionMode])
   useEffect(() => { try { localStorage.setItem('ccd:effort', thinkingEffort) } catch {} }, [thinkingEffort])
 
   // 侧边栏拖拽调整大小
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
       if (!isDraggingSidebarRef.current) return
-      const newWidth = Math.min(500, Math.max(200, e.clientX))
+      const newWidth = Math.min(480, Math.max(220, e.clientX))
       setSidebarWidth(newWidth)
     }
     const handleMouseUp = () => {
@@ -321,7 +403,7 @@ export default function App() {
 
   /* ---- select conversation and load messages ---- */
   const selectConversation = useCallback(async (id: string) => {
-    if (isStreaming) return
+    abortActiveStream()
     setActiveConvId(id)
     setActiveHistoryId(null) // 清除历史对话选中状态
     setHistoryDetail(null)
@@ -330,7 +412,7 @@ export default function App() {
     try {
       const res = await ipc.invoke<{ ok: boolean; messages?: Message[]; error?: string }>('message:list', { conversationId: id })
       if (res?.ok && res.messages) {
-        setMessages(res.messages)
+        setMessages(res.messages.map(deserializeMessageBlocks))
       } else {
         setMessages([])
         if (res?.error) setError(res.error)
@@ -342,7 +424,7 @@ export default function App() {
     } finally {
       setLoadingMsgs(false)
     }
-  }, [isStreaming])
+  }, [abortActiveStream])
 
   const loadConversations = useCallback(async () => {
     try {
@@ -371,10 +453,21 @@ export default function App() {
   const loadConversationsRef = useRef(loadConversations)
   loadConversationsRef.current = loadConversations
 
+  /* ---- switch into a branched conversation ---- */
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const convId = (e as CustomEvent<{ convId?: string }>).detail?.convId;
+      if (convId) selectConversation(convId);
+    };
+    window.addEventListener('ccd:switch-conv', handler);
+    return () => window.removeEventListener('ccd:switch-conv', handler);
+  }, [selectConversation]);
+
   /* ---- subscribe to stream events ---- */
   useEffect(() => {
-    const unsubChunk = ipc.on('stream:chunk', (data: { conversationId: string; chunk: StreamChunk }) => {
+    const unsubChunk = ipc.on('stream:chunk', (data: StreamChunkPayload) => {
       if (data.conversationId !== activeConvIdRef.current) return
+      if (streamStateRef.current === 'THINKING') dispatchStream({ type: 'FIRST_CHUNK' })
       const chunk = data.chunk
 
       // text / thinking / tool_use / tool_result / permission_denial：累积到 contentBlocks
@@ -399,7 +492,7 @@ export default function App() {
 
       // text-replace：窗口绑定时重放累积文本
       if (chunk.type === 'text-replace' && chunk.content !== undefined) {
-        setIsStreaming(true)
+        dispatchStream({ type: 'RESUME' })
         setMessages((prev) => {
           const last = prev[prev.length - 1]
           if (last && last.role === 'assistant') {
@@ -423,15 +516,15 @@ export default function App() {
       }
     })
 
-    const unsubEnd = ipc.on('stream:end', (data: { conversationId: string }) => {
+    const unsubEnd = ipc.on('stream:end', (data: StreamEndPayload) => {
       if (data.conversationId !== activeConvIdRef.current) return
-      setIsStreaming(false)
+      dispatchStream({ type: 'STOPPED' })
       loadConversationsRef.current()
     })
 
-    const unsubError = ipc.on('stream:error', (data: { conversationId: string; error: string }) => {
+    const unsubError = ipc.on('stream:error', (data: StreamErrorPayload) => {
       if (data.conversationId !== activeConvIdRef.current) return
-      setIsStreaming(false)
+      dispatchStream({ type: 'ERROR' })
       setMessages((prev) => {
         const last = prev[prev.length - 1]
         if (last && last.role === 'assistant' && !last.content) {
@@ -462,12 +555,13 @@ export default function App() {
 
   /* ---- new chat ---- */
   const handleNewChat = async () => {
-    if (isStreaming) return
+    abortActiveStream()
     try {
       const conv = await ipc.invoke<Conversation>('conversation:create', {
         title: 'New Chat',
         projectPath: newChatProjectPath || null,
         model: selectedModel,
+        kind: viewMode,
       })
       setConversations((prev) => [conv, ...prev])
       setActiveConvId(conv.id)
@@ -484,12 +578,13 @@ export default function App() {
 
   /* ---- quick chat (no project folder) ---- */
   const handleQuickChat = async () => {
-    if (isStreaming) return
+    abortActiveStream()
     try {
       const conv = await ipc.invoke<Conversation>('conversation:create', {
         title: 'New Chat',
         projectPath: null,
         model: selectedModel,
+        kind: viewMode,
       })
       setConversations((prev) => [conv, ...prev])
       setActiveConvId(conv.id)
@@ -614,13 +709,16 @@ export default function App() {
 
   /* ---- stop generation ---- */
   const handleStop = () => {
-    if (activeConvId) ipc.invoke('stop:generation', { conversationId: activeConvId })
+    if (activeConvId) {
+      dispatchStream({ type: 'STOP_REQUESTED' })
+      ipc.invoke('stop:generation', { conversationId: activeConvId })
+    }
   }
   stopRef.current = handleStop
 
   /* ---- 选择历史对话 ---- */
   const selectHistoryConversation = useCallback(async (conv: HistoryConversation) => {
-    if (isStreaming) return
+    abortActiveStream()
     setActiveHistoryId(conv.sessionId)
     setActiveConvId(null) // 取消普通对话的选中状态
     setLoadingHistory(true)
@@ -629,13 +727,17 @@ export default function App() {
         projectPath: conv.projectPath,
         sessionId: conv.sessionId,
       })
-      setHistoryDetail(detail)
+      if (detail) {
+        setHistoryDetail({ ...detail, messages: detail.messages.map(plainifyJSONContent) })
+      } else {
+        setHistoryDetail(null)
+      }
     } catch {
       setHistoryDetail(null)
     } finally {
       setLoadingHistory(false)
     }
-  }, [isStreaming])
+  }, [abortActiveStream])
 
   /* ---- send message ---- */
   const handleSend = async (text: string, attachments: Attachment[] = []) => {
@@ -659,7 +761,10 @@ export default function App() {
       timestamp: now,
     }
     setMessages((prev) => [...prev, userMsg, assistantMsg])
-    setIsStreaming(true)
+    streamAbortRef.current?.abort()
+    const ac = new AbortController()
+    streamAbortRef.current = ac
+    dispatchStream({ type: 'SEND' })
 
     try {
       const res = await ipc.invoke<{ ok: boolean; error?: string }>('message:send', {
@@ -669,8 +774,9 @@ export default function App() {
         permissionMode,
         thinkingEffort,
       })
+      if (ac.signal.aborted) return
       if (!res?.ok) {
-        setIsStreaming(false)
+        dispatchStream({ type: 'STOPPED' })
         setError(res?.error || 'Failed to send message')
         setMessages((prev) => {
           const last = prev[prev.length - 1]
@@ -679,8 +785,9 @@ export default function App() {
         })
       }
     } catch (e) {
+      if (ac.signal.aborted) return
       console.error('Failed to send message:', e)
-      setIsStreaming(false)
+      dispatchStream({ type: 'STOPPED' })
       setError('Failed to send message. Please try again.')
       setMessages((prev) => {
         const last = prev[prev.length - 1]
@@ -717,7 +824,10 @@ export default function App() {
       timestamp: now,
     }
     setMessages((prev) => [...prev, assistantMsg])
-    setIsStreaming(true)
+    streamAbortRef.current?.abort()
+    const ac = new AbortController()
+    streamAbortRef.current = ac
+    dispatchStream({ type: 'SEND' })
     try {
       const res = await ipc.invoke<{ ok: boolean; error?: string }>('message:send', {
         conversationId: activeConvId,
@@ -726,8 +836,9 @@ export default function App() {
         permissionMode: 'auto-edit',
         thinkingEffort,
       })
+      if (ac.signal.aborted) return
       if (!res?.ok) {
-        setIsStreaming(false)
+        dispatchStream({ type: 'STOPPED' })
         setError(res?.error || 'Failed to resend')
         setMessages((prev) => {
           const last = prev[prev.length - 1]
@@ -736,7 +847,8 @@ export default function App() {
         })
       }
     } catch (e) {
-      setIsStreaming(false)
+      if (ac.signal.aborted) return
+      dispatchStream({ type: 'STOPPED' })
       setError('Failed to resend message')
     }
   }, [activeConvId, isStreaming, messages, thinkingEffort])
@@ -823,7 +935,15 @@ export default function App() {
       {/* Left sidebar */}
       <aside
         className="glass sidebar-accent flex flex-col flex-shrink-0 relative"
-        style={{ width: sidebarCollapsed ? 0 : `${sidebarWidth}px`, borderRight: sidebarCollapsed ? 'none' : '1px solid var(--border-default)', transition: isDraggingSidebarRef.current ? 'none' : 'width 200ms ease', overflow: 'hidden' }}
+        style={{
+          width: sidebarCollapsed ? 0 : `${sidebarWidth}px`,
+          minWidth: sidebarCollapsed ? 0 : '220px',
+          maxWidth: '480px',
+          borderRight: sidebarCollapsed ? 'none' : '1px solid var(--border-default)',
+          transition: isDraggingSidebarRef.current ? 'none' : 'width 200ms ease',
+          overflow: 'hidden',
+          isolation: 'isolate',
+        }}
       >
         {/* 右边缘拖拽条 */}
         {!sidebarCollapsed && (
@@ -874,7 +994,7 @@ export default function App() {
 
         {/* Model selector */}
         <div className="px-4 pb-2.5">
-          <ModelSelector selected={selectedModel} models={models} onSelect={handleModelSelect} />
+          <ModelSelector selected={selectedModel} models={models} onSelect={handleModelSelect} collapsed={sidebarCollapsed} />
         </div>
 
 
@@ -1107,7 +1227,7 @@ export default function App() {
       </aside>
 
       {/* Right: Chat area */}
-      <main className="flex-1 flex flex-col overflow-hidden">
+      <main className="flex-1 flex flex-col overflow-hidden" style={{ minWidth: '320px', isolation: 'isolate' }}>
         {/* Header */}
         <header
           className="drag-region glass flex items-center justify-between px-5 flex-shrink-0"
@@ -1126,20 +1246,20 @@ export default function App() {
             </span>
           </div>
           <div className="flex items-center gap-2 no-drag flex-shrink-0">
-            {/* 视图模式切换：Terminal / Chat */}
+            {/* 视图模式切换：Agent / Terminal / Chat */}
             {!activeHistoryId && activeConvId && (
               <div className="flex items-center gap-0.5 p-0.5 rounded-lg" style={{ background: 'var(--bg-surface-2)' }}>
                 <button
-                  onClick={() => setViewMode('terminal')}
+                  onClick={() => setViewMode('agent')}
                   className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium transition-all"
                   style={{
-                    background: viewMode === 'terminal' ? 'var(--accent-subtle)' : 'transparent',
-                    color: viewMode === 'terminal' ? 'var(--accent-bright)' : 'var(--fg-tertiary)',
+                    background: viewMode === 'agent' ? 'var(--accent-subtle)' : 'transparent',
+                    color: viewMode === 'agent' ? 'var(--accent-bright)' : 'var(--fg-tertiary)',
                   }}
-                  title="Interactive Claude Code terminal (full CLI capabilities)"
+                  title="Pure GUI Agent mode (SDK-powered)"
                 >
-                  <Terminal size={12} />
-                  <span>Terminal</span>
+                  <Sparkles size={12} />
+                  <span>Agent</span>
                 </button>
                 <button
                   onClick={() => setViewMode('chat')}
@@ -1222,27 +1342,35 @@ export default function App() {
               <span className="text-[12px] text-[var(--fg-tertiary)]">Loading history…</span>
             </div>
           </div>
-        ) : viewMode === 'terminal' && activeConvId ? (
-          <ClaudeTerminalView
+        ) : viewMode === 'agent' && activeConvId ? (
+          <AgentConversationView
             key={activeConvId}
-            sessionId={activeConvId}
-            cwd={project?.path || newChatProjectPath || '~'}
+            conversationId={activeConvId}
+            cwd={project?.path || newChatProjectPath || ''}
             model={selectedModel}
-            resumeSessionId={activeConv?.claudeSessionId}
             permissionMode={permissionMode}
-            onSessionIdCaptured={(sid) => {
-              // Persist captured claude session ID to the conversation for --resume
+            thinkingEffort={thinkingEffort}
+            models={models}
+            permissionModes={PERMISSION_MODES}
+            thinkingEfforts={THINKING_EFFORTS}
+            onModelChange={handleModelSelect}
+            onPermissionModeChange={setPermissionMode}
+            onThinkingEffortChange={setThinkingEffort}
+            onSessionIdChange={(sid) => {
               if (activeConvId && activeConv?.claudeSessionId !== sid) {
                 ipc.invoke('conversation:set-session-id', { id: activeConvId, sessionId: sid }).catch(() => {})
               }
-              // Start session watcher for structured event extraction
-              if (activeConvId && sid) {
-                const cwdPath = project?.path || newChatProjectPath || '~'
-                ipc.invoke('session-watcher:start', { id: activeConvId, sessionId: sid, cwd: cwdPath }).catch(() => {})
-                setRightPanelOpen(true)
-              }
             }}
+            onOpenActivity={() => setRightPanelOpen(true)}
           />
+        ) : viewMode === 'agent' ? (
+          /* Agent mode with no conversation selected — show placeholder */
+          <div className="flex-1 flex items-center justify-center">
+            <div className="flex flex-col items-center gap-3">
+              <Sparkles size={28} style={{ color: 'var(--fg-quaternary)' }} />
+              <span className="text-[13px]" style={{ color: 'var(--fg-quaternary)' }}>Select or create a conversation to start</span>
+            </div>
+          </div>
         ) : (
           <ChatView
             messages={messages}
@@ -1378,6 +1506,63 @@ export default function App() {
                 {cliInfo?.error && (
                   <div className="text-[11px] mt-1.5" style={{ color: 'var(--danger)' }}>{cliInfo.error}</div>
                 )}
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>API Key</div>
+                <div className="text-[11px] mb-2" style={{ color: 'var(--fg-tertiary)' }}>
+                  Required for Agent SDK mode. Your key is stored locally and never sent to third parties.
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 relative">
+                    <input
+                      type={apiKeyVisible ? 'text' : 'password'}
+                      value={apiKey}
+                      onChange={(e) => { setApiKey(e.target.value); setApiKeySaved(false) }}
+                      placeholder="sk-ant-api03-..."
+                      className="w-full px-3 py-2 rounded-lg text-[12px] font-mono outline-none transition-all"
+                      style={{
+                        background: 'var(--bg-input)',
+                        border: '1px solid var(--border-default)',
+                        color: 'var(--fg-primary)',
+                      }}
+                      onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent-primary)'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(124,91,245,0.08)' }}
+                      onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border-default)'; e.currentTarget.style.boxShadow = 'none' }}
+                    />
+                    <button
+                      onClick={() => setApiKeyVisible(v => !v)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded transition-colors hover:bg-[var(--tint-hover)]"
+                      title={apiKeyVisible ? 'Hide' : 'Show'}
+                    >
+                      {apiKeyVisible ? <EyeOff size={12} style={{ color: 'var(--fg-quaternary)' }} /> : <Eye size={12} style={{ color: 'var(--fg-quaternary)' }} />}
+                    </button>
+                  </div>
+                  <button
+                    onClick={() => {
+                      ipc.invoke('settings:set', { key: 'apiKey', value: apiKey })
+                        .then(() => { setApiKeySaved(true); setTimeout(() => setApiKeySaved(false), 2000) })
+                        .catch(() => {})
+                    }}
+                    className="px-3 py-2 rounded-lg text-[11px] font-medium transition-all flex items-center gap-1.5"
+                    style={{
+                      background: apiKeySaved ? 'rgba(48,209,88,0.12)' : 'var(--accent-subtle)',
+                      color: apiKeySaved ? 'var(--success)' : 'var(--accent-bright)',
+                      border: `1px solid ${apiKeySaved ? 'rgba(48,209,88,0.2)' : 'rgba(124,91,245,0.15)'}`,
+                    }}
+                  >
+                    {apiKeySaved ? <><Check size={12} /> Saved</> : 'Save'}
+                  </button>
+                </div>
+                <a
+                  href="https://console.anthropic.com/settings/keys"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 mt-2 text-[11px] transition-colors"
+                  style={{ color: 'var(--accent-bright)' }}
+                >
+                  <Key size={10} />
+                  Get an API key from Anthropic Console
+                  <ExternalLink size={10} />
+                </a>
               </div>
               <div>
                 <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>Theme</div>

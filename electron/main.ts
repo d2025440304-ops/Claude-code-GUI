@@ -26,9 +26,10 @@ import {
   CliSpawner,
   ChunkEvent,
   CloseEvent,
-  ErrorEvent,
+  CLIErrorEvent,
   StderrEvent,
 } from './integration/cli-spawner';
+import type { StreamChunkPayload, StreamEndPayload, StreamErrorPayload } from './ipc/contracts';
 import { AppDatabase } from './db/database';
 import { ConversationRepo, Conversation } from './db/repositories/conversation-repo';
 import { MessageRepo, Message, Attachment } from './db/repositories/message-repo';
@@ -37,6 +38,8 @@ import { scanHistorySummaries, loadConversationDetail, HistoryConversation, Hist
 import { PtyManager } from './integration/pty-manager';
 import { ClaudePtyManager, ClaudePtyPermission } from './integration/claude-pty-manager';
 import { SessionWatcherManager, SessionEvent } from './integration/session-watcher';
+import { AgentSdkBridge } from './integration/agent-sdk-bridge';
+import type { PermissionDecision } from './types/agent';
 
 // ---------------------------------------------------------------------------
 // Constants & module state
@@ -70,6 +73,20 @@ const cliSpawner = new CliSpawner();
 const ptyManager = new PtyManager();
 const claudePtyManager = new ClaudePtyManager();
 const sessionWatcherManager = new SessionWatcherManager();
+const agentBridge = new AgentSdkBridge();
+
+/** Simple settings store (JSON file in userData). */
+const SETTINGS_FILE = path.join(app.getPath('userData'), 'agent-settings.json');
+function loadSettings(): Record<string, unknown> {
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+  } catch {
+    return {};
+  }
+}
+function saveSettings(s: Record<string, unknown>): void {
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2), 'utf-8');
+}
 
 /** Cached CLI detection result (refreshed on each `cli:check` call). */
 let cliInfo: CliInfo | null = null;
@@ -309,6 +326,50 @@ function flushAllPending(): void {
     flushTimers.delete(id);
     flushAssistantText(id);
   }
+  // Flush any pending agent SDK messages
+  for (const convId of Array.from(agentTextAccum.keys())) {
+    flushAgentMessages(convId);
+  }
+}
+
+// --- Agent SDK message persistence (module-level for before-quit access) ---
+const agentTextAccum = new Map<string, string>();
+const agentAssistantMsgIds = new Map<string, string>();
+const agentContentBlocks = new Map<string, unknown[]>();
+
+function flushAgentMessages(convId: string): void {
+  const text = agentTextAccum.get(convId);
+  const blocks = agentContentBlocks.get(convId);
+  const msgId = agentAssistantMsgIds.get(convId);
+
+  try {
+    const contentParts: unknown[] = [];
+    if (text && text.trim()) {
+      contentParts.push({ type: 'text', text: text.trim() });
+    }
+    if (blocks && blocks.length > 0) {
+      contentParts.push(...blocks);
+    }
+    const serialized = contentParts.length > 0 ? JSON.stringify(contentParts) : (text || '');
+
+    if (msgId) {
+      messageRepo.updateContent(msgId, serialized);
+    } else if (serialized) {
+      const msg = messageRepo.create(convId, 'assistant', serialized);
+      agentAssistantMsgIds.set(convId, msg.id);
+    }
+
+    const preview = text ? (text.length > 200 ? text.slice(0, 200) + '…' : text) : '';
+    if (preview) {
+      conversationRepo.updateLastMessage(convId, preview);
+    }
+  } catch (err) {
+    console.error('[Main] Failed to persist agent messages:', err);
+  }
+
+  agentTextAccum.delete(convId);
+  agentAssistantMsgIds.delete(convId);
+  agentContentBlocks.delete(convId);
 }
 
 /**
@@ -352,7 +413,7 @@ function setupStreamListeners(): void {
     }
 
     // Push every chunk to the renderer for live display.
-    sendToConv(conversationId, Channels.STREAM_CHUNK, { conversationId, chunk });
+    sendToConv(conversationId, Channels.STREAM_CHUNK, { conversationId, chunk } satisfies StreamChunkPayload);
   });
 
   cliSpawner.on('stderr', ({ sessionId, data }: StderrEvent) => {
@@ -381,13 +442,13 @@ function setupStreamListeners(): void {
     sendToConv(conversationId, Channels.TYPING, { conversationId, isTyping: false });
 
     // Notify renderer that the stream has ended.
-    sendToConv(conversationId, Channels.STREAM_END, { conversationId, exitCode });
+    sendToConv(conversationId, Channels.STREAM_END, { conversationId, exitCode } satisfies StreamEndPayload);
 
     // Refresh sidebars in all windows (preview/title may have changed).
     broadcast(Channels.CONVERSATIONS_CHANGED);
   });
 
-  cliSpawner.on('error', ({ sessionId, error }: ErrorEvent) => {
+  cliSpawner.on('error', ({ sessionId, error }: CLIErrorEvent) => {
     const conversationId = sessionId;
 
     // Persist whatever assistant text arrived before the error.
@@ -395,7 +456,14 @@ function setupStreamListeners(): void {
     clearSessionState(conversationId);
 
     sendToConv(conversationId, Channels.TYPING, { conversationId, isTyping: false });
-    sendToConv(conversationId, Channels.STREAM_ERROR, { conversationId, error });
+    // `error` stays a human-readable string for the renderer; structured
+    // diagnostics let the UI tailor messaging (network vs not-found, etc.).
+    sendToConv(conversationId, Channels.STREAM_ERROR, {
+      conversationId,
+      error: error.message,
+      kind: error.kind,
+      exitCode: error.exitCode,
+    } satisfies StreamErrorPayload);
   });
 }
 
@@ -409,6 +477,7 @@ interface ConversationCreatePayload {
   title?: string;
   projectPath?: string | null;
   model?: string;
+  kind?: 'agent' | 'chat';
 }
 
 interface ConversationIdPayload {
@@ -450,10 +519,10 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     Channels.CONVERSATION_CREATE,
     (_e: IpcMainInvokeEvent, payload: ConversationCreatePayload): Conversation => {
-      const title = payload.title?.trim() || 'New Conversation';
+     const title = payload.title?.trim() || 'New Conversation';
       const projectPath = payload.projectPath ?? null;
       const model = payload.model || DEFAULT_MODEL;
-      const conv = conversationRepo.create(title, projectPath, model);
+      const conv = conversationRepo.create(title, projectPath, model, payload.kind || 'chat');
       broadcast(Channels.CONVERSATIONS_CHANGED);
       return conv;
     },
@@ -468,6 +537,8 @@ function registerIpcHandlers(): void {
       claudePtyManager.kill(payload.id);
       // 停止 session watcher
       sessionWatcherManager.stop(payload.id);
+      // 销毁 agent session（如果有）
+      agentBridge.destroySession(payload.id);
       conversationRepo.delete(payload.id);
       broadcast(Channels.CONVERSATIONS_CHANGED);
       return { ok: true };
@@ -497,13 +568,50 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     Channels.CONVERSATION_CLEAR,
-    (_e: IpcMainInvokeEvent, payload: ConversationIdPayload): { ok: boolean } => {
+    (_e: IpcMainInvokeEvent, payload: ConversationIdPayload)
+
+: { ok: boolean } => {
       messageRepo.deleteByConversation(payload.id);
       conversationRepo.updateLastMessage(payload.id, '');
       broadcast(Channels.CONVERSATIONS_CHANGED);
       return { ok: true };
     },
   );
+
+  ipcMain.handle(
+    Channels.CONVERSATION_BRANCH,
+    (
+      _e: IpcMainInvokeEvent,
+      payload: { sourceConvId: string; messageId: string; title?: string },
+    ): { ok: boolean; conversation?: Conversation; error?: string } => {
+      try {
+        const source = conversationRepo.getById(payload.sourceConvId);
+        if (!source) return { ok: false, error: 'Source conversation not found' };
+
+        const title = payload.title || `${source.title} (branch)`;
+        const newConv = conversationRepo.create(title, source.projectPath, source.model, source.kind);
+
+        const allMessages = messageRepo.getByConversation(payload.sourceConvId);
+        const targetIdx = allMessages.findIndex((m) => m.id === payload.messageId);
+        if (targetIdx >= 0) {
+          const messagesToCopy = allMessages.slice(0, targetIdx + 1);
+          for (const msg of messagesToCopy) {
+            messageRepo.create(newConv.id, msg.role, msg.content, msg.attachments);
+          }
+          conversationRepo.updateLastMessage(
+            newConv.id,
+            messagesToCopy[messagesToCopy.length - 1]?.content?.slice(0, 200) || '',
+          );
+        }
+
+        broadcast(Channels.CONVERSATIONS_CHANGED);
+        return { ok: true, conversation: newConv };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+    },
+  );
+
 
   ipcMain.handle(
     Channels.CONVERSATION_SET_MODEL,
@@ -722,7 +830,7 @@ function registerIpcHandlers(): void {
               contents.send(Channels.STREAM_CHUNK, {
                 conversationId: convId,
                 chunk: { type: 'text-replace', content: textAccumulators.get(convId) ?? '' },
-              });
+              } satisfies StreamChunkPayload);
             }
           }
         }
@@ -1124,6 +1232,201 @@ function registerIpcHandlers(): void {
     },
   );
 
+  // ---------------------------------------------------------------------------
+  // Agent SDK IPC handlers
+  // ---------------------------------------------------------------------------
+
+  // Wire up the bridge event callback to push events to the renderer + persist
+  agentBridge.onEvent((convId, event) => {
+    // --- Persistence logic ---
+    switch (event.type) {
+      case 'text': {
+        // Full text block from assistant message
+        const prev = agentTextAccum.get(convId) || '';
+        agentTextAccum.set(convId, prev + (event as any).text);
+        break;
+      }
+      case 'text_delta': {
+        // Streaming delta — accumulate
+        const prev = agentTextAccum.get(convId) || '';
+        agentTextAccum.set(convId, prev + (event as any).delta);
+        break;
+      }
+      case 'tool_use': {
+        // Persist tool_use as structured content block
+        const blocks = agentContentBlocks.get(convId) || [];
+        blocks.push({
+          type: 'tool_use',
+          toolName: (event as any).toolName,
+          toolUseId: (event as any).toolUseId,
+          input: (event as any).input,
+        });
+        agentContentBlocks.set(convId, blocks);
+        // Also persist user message (the prompt that triggered this turn)
+        break;
+      }
+      case 'tool_result': {
+        // Persist tool_result
+        const blocks = agentContentBlocks.get(convId) || [];
+        blocks.push({
+          type: 'tool_result',
+          toolUseId: (event as any).toolUseId,
+          content: (event as any).content,
+          isError: (event as any).isError,
+        });
+        agentContentBlocks.set(convId, blocks);
+        break;
+      }
+      case 'thinking': {
+        const blocks = agentContentBlocks.get(convId) || [];
+        blocks.push({ type: 'thinking', text: (event as any).text });
+        agentContentBlocks.set(convId, blocks);
+        break;
+      }
+      case 'result': {
+        // Turn complete — flush all accumulated messages
+        flushAgentMessages(convId);
+        broadcast(Channels.CONVERSATIONS_CHANGED);
+        break;
+      }
+    }
+
+    // --- Push to renderer ---
+    for (const [winId, boundConvId] of windowBindings) {
+      if (boundConvId !== convId) continue;
+      const win = BrowserWindow.fromId(winId);
+      if (!win || win.isDestroyed()) continue;
+      const contents = win.webContents;
+      if (!contents || contents.isDestroyed()) continue;
+      contents.send(Channels.AGENT_EVENT, { convId, event });
+    }
+  });
+
+  ipcMain.handle(
+    Channels.AGENT_CREATE,
+    (_e: IpcMainInvokeEvent, payload: {
+      convId: string;
+      cwd: string;
+      model?: string;
+      permissionMode?: string;
+      thinkingEffort?: string;
+    }): { ok: boolean; sessionStatus: string } => {
+      const settings = loadSettings();
+      agentBridge.createSession(payload.convId, {
+        cwd: payload.cwd,
+        model: payload.model,
+        permissionMode: payload.permissionMode as any,
+        thinkingEffort: payload.thinkingEffort as any,
+        apiKey: settings.apiKey as string | undefined,
+      });
+      return { ok: true, sessionStatus: agentBridge.getStatus(payload.convId) };
+    },
+  );
+
+  ipcMain.handle(
+    Channels.AGENT_SEND,
+    async (_e: IpcMainInvokeEvent, payload: {
+      convId: string;
+      text: string;
+      model?: string;
+      permissionMode?: string;
+      thinkingEffort?: string;
+    }): Promise<{ ok: boolean }> => {
+     try {
+        // Flush any previous turn's partial data before starting a new turn,
+        // so the accumulated assistant blocks are committed to DB cleanly.
+        flushAgentMessages(payload.convId);
+        // Persist the user message to the database
+        try {
+          messageRepo.create(payload.convId, 'user', payload.text);
+          conversationRepo.updateLastMessage(payload.convId, payload.text);
+        } catch (err) {
+          console.error('[Main] Failed to persist agent user message:', err);
+        }
+
+        // Update session options if provided (for mid-conversation changes)
+        agentBridge.updateOptions(payload.convId, {
+          model: payload.model,
+          permissionMode: payload.permissionMode as any,
+          thinkingEffort: payload.thinkingEffort as any,
+        });
+
+        // Fire-and-forget: sendMessage runs the whole turn asynchronously.
+        // Errors are caught and emitted to the renderer so the user sees them.
+        agentBridge.sendMessage(payload.convId, payload.text).catch((err) => {
+          console.error('[Main] Agent sendMessage failed:', err);
+        });
+        return { ok: true };
+      } catch (err: unknown) {
+        return { ok: false };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    Channels.AGENT_ABORT,
+    async (_e: IpcMainInvokeEvent, payload: { convId: string }): Promise<{ ok: boolean }> => {
+      await agentBridge.abort(payload.convId);
+      return { ok: true };
+    },
+  );
+
+  ipcMain.handle(
+    Channels.AGENT_PERMISSION_RESPOND,
+    (_e: IpcMainInvokeEvent, payload: { convId: string; decision: PermissionDecision }): { ok: boolean } => {
+      agentBridge.respondPermission(payload.convId, payload.decision);
+      return { ok: true };
+    },
+  );
+
+  ipcMain.handle(
+    Channels.AGENT_GET_STATUS,
+    (_e: IpcMainInvokeEvent, payload: { convId: string }): { status: string } => {
+      return { status: agentBridge.getStatus(payload.convId) };
+    },
+  );
+
+  ipcMain.handle(
+    Channels.AGENT_GET_CHANGED_FILES,
+    (_e: IpcMainInvokeEvent, payload: { convId: string }): { files: { tool: string; timestamp: number; filePath: string }[] } => {
+      return { files: agentBridge.getChangedFiles(payload.convId) };
+    },
+  );
+
+  ipcMain.handle(
+    Channels.AGENT_DESTROY,
+    (_e: IpcMainInvokeEvent, payload: { convId: string }): { ok: boolean } => {
+      agentBridge.destroySession(payload.convId);
+      return { ok: true };
+    },
+  );
+
+  ipcMain.handle(
+    Channels.AGENT_GET_PENDING_PERMISSION,
+    (_e: IpcMainInvokeEvent, payload: { convId: string }): unknown => {
+      return agentBridge.getPendingPermission(payload.convId);
+    },
+  );
+
+  // Settings
+  ipcMain.handle(
+    Channels.SETTINGS_GET,
+    (_e: IpcMainInvokeEvent, payload: { key: string }): { value: unknown } => {
+      const settings = loadSettings();
+      return { value: settings[payload.key] };
+    },
+  );
+
+  ipcMain.handle(
+    Channels.SETTINGS_SET,
+    (_e: IpcMainInvokeEvent, payload: { key: string; value: unknown }): { ok: boolean } => {
+      const settings = loadSettings();
+      settings[payload.key] = payload.value;
+      saveSettings(settings);
+      return { ok: true };
+    },
+  );
+
   // -- File explorer
 
   ipcMain.handle(
@@ -1170,6 +1473,54 @@ function registerIpcHandlers(): void {
   );
 
   // -- Git diff ---------------------------------------------------------------
+
+
+  ipcMain.handle(
+    Channels.FILE_SEARCH,
+    (e: IpcMainInvokeEvent, payload: { query: string; cwd?: string }): { name: string; path: string; isDirectory: boolean }[] => {
+      try {
+        const { query, cwd } = payload;
+        if (!query || query.length < 1) return [];
+        // Use the active conversation's project path as the search root
+        const searchRoot = cwd || e.sender.getTitle() || os.homedir();
+        const lowerQuery = query.toLowerCase();
+        // Simple recursive search limited to 3 levels deep
+        const results: { name: string; path: string; isDirectory: boolean }[] = [];
+        const maxResults = 20;
+        const maxDepth = 3;
+        const ignored = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', '.venv', 'venv']);
+
+        function walk(dir: string, depth: number) {
+          if (depth > maxDepth || results.length >= maxResults) return;
+          let entries: fs.Dirent[];
+          try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+          for (const entry of entries) {
+            if (results.length >= maxResults) return;
+            if (ignored.has(entry.name)) continue;
+            if (entry.name.startsWith('.')) continue;
+            const fullPath = path.join(dir, entry.name);
+            const isDir = entry.isDirectory();
+            if (entry.name.toLowerCase().includes(lowerQuery)) {
+              results.push({ name: entry.name, path: fullPath, isDirectory: isDir });
+            }
+            if (isDir) walk(fullPath, depth + 1);
+          }
+        }
+        walk(searchRoot, 0);
+        // Sort: exact prefix matches first, then alphabetical
+        results.sort((a, b) => {
+          const aPrefix = a.name.toLowerCase().startsWith(lowerQuery) ? 0 : 1;
+          const bPrefix = b.name.toLowerCase().startsWith(lowerQuery) ? 0 : 1;
+          if (aPrefix !== bPrefix) return aPrefix - bPrefix;
+          return a.name.localeCompare(b.name);
+        });
+        return results;
+      } catch (err) {
+        console.error('[Main] File search error:', err);
+        return [];
+      }
+    },
+  );
 
   ipcMain.handle(
     Channels.GIT_DIFF,
@@ -1352,9 +1703,10 @@ app.on('activate', () => {
 app.on('before-quit', () => {
   // Persist any in-flight assistant responses before shutting down.
   flushAllPending();
-  cliSpawner.stopAll();
+  cliSpawner.destroyAll();
   ptyManager.killAll();
   claudePtyManager.killAll();
   sessionWatcherManager.stopAll();
+  agentBridge.destroyAll();
   database.close();
 });

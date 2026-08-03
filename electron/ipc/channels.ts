@@ -12,6 +12,7 @@ export const Channels = {
   CONVERSATION_PIN: 'conversation:pin',
   CONVERSATION_RENAME: 'conversation:rename',
   CONVERSATION_CLEAR: 'conversation:clear',
+  CONVERSATION_BRANCH: 'conversation:branch',
   CONVERSATION_SET_MODEL: 'conversation:set-model',
   CONVERSATION_SET_SESSION_ID: 'conversation:set-session-id',
 
@@ -76,9 +77,27 @@ export const Channels = {
   CLAUDE_PTY_EXIT: 'claude-pty:exit',
   CLAUDE_PTY_PERMISSION: 'claude-pty:permission',
 
+  // Agent SDK (纯 GUI 模式) — invoke/handle
+  AGENT_CREATE: 'agent:create',
+  AGENT_SEND: 'agent:send',
+  AGENT_ABORT: 'agent:abort',
+  AGENT_PERMISSION_RESPOND: 'agent:permission-respond',
+  AGENT_GET_STATUS: 'agent:get-status',
+  AGENT_GET_CHANGED_FILES: 'agent:get-changed-files',
+  AGENT_GET_PENDING_PERMISSION: 'agent:get-pending-permission',
+  AGENT_DESTROY: 'agent:destroy',
+
+  // Agent SDK — push (main → renderer)
+  AGENT_EVENT: 'agent:event',
+
+  // Settings — invoke/handle
+  SETTINGS_GET: 'settings:get',
+  SETTINGS_SET: 'settings:set',
+
   // File explorer — invoke/handle
   FILE_LIST: 'file:list',
   FILE_READ: 'file:read',
+  FILE_SEARCH: 'file:search',
 
   // Git diff — invoke/handle
   GIT_DIFF: 'git:diff',
@@ -113,4 +132,5 @@ export const PUSH_CHANNELS: ReadonlySet<string> = new Set([
   Channels.CLAUDE_PTY_EXIT,
   Channels.CLAUDE_PTY_PERMISSION,
   Channels.SESSION_EVENT,
+  Channels.AGENT_EVENT,
 ]);

@@ -5,7 +5,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { GitCompare, RefreshCw, File, Loader2, Plus, Minus } from 'lucide-react'
-import { ipc } from '../lib/ipc'
+import { ipc, Channels } from '../lib/ipc';
 
 interface DiffFile {
   path: string
@@ -64,6 +64,17 @@ export default function CodeReview({ projectPath }: CodeReviewProps) {
       }, 500)
     })
     return () => { unsub(); if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current) }
+  }, [loadDiff])
+
+  // Agent SDK mode: listen for agent:event file_changed
+  useEffect(() => {
+    const unsub = ipc.on(Channels.AGENT_EVENT, (data: { convId: string; event: Record<string, unknown> }) => {
+      const event = data.event
+      if (event.type !== 'file_changed') return
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+      refreshTimerRef.current = setTimeout(() => { loadDiff() }, 500)
+    })
+    return () => { unsub() }
   }, [loadDiff])
 
   const toggleFile = (path: string) => {

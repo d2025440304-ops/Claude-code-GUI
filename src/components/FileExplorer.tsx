@@ -7,7 +7,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Folder, FolderOpen, File, FileCode, FileText, FileJson, Image, Loader2, ChevronRight, RefreshCw } from 'lucide-react'
-import { ipc } from '../lib/ipc'
+import { ipc, Channels } from '../lib/ipc';
 
 interface FileEntry {
   name: string
@@ -93,6 +93,30 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
       }, 300)
     })
     return () => { unsub(); if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current) }
+  }, [loadRoot])
+
+  // Agent SDK mode: listen for agent:event file_changed
+  useEffect(() => {
+    const unsub = ipc.on(Channels.AGENT_EVENT, (data: { convId: string; event: Record<string, unknown> }) => {
+      const event = data.event
+      if (event.type !== 'file_changed') return
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+      refreshTimerRef.current = setTimeout(() => {
+        loadRoot()
+        setDirContents(prev => {
+          const next = new Map(prev)
+          for (const [dirPath] of next) {
+            ipc.invoke<FileEntry[]>('file:list', { dirPath })
+              .then(result => {
+                if (result) setDirContents(prev2 => new Map(prev2).set(dirPath, result))
+              })
+              .catch(() => {})
+          }
+          return next
+        })
+      }, 300)
+    })
+    return () => { unsub() }
   }, [loadRoot])
 
   // 展开/折叠目录

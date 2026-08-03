@@ -1,17 +1,17 @@
 /**
  * 右侧面板容器组件。
  *
- * 四个 Tab 用 CSS display 控制显隐，避免组件卸载重建。
+ * 四个 Tab (Activity / Files / Terminal / Review) 用 CSS display 控制显隐。
  * 支持拖拽左边缘调整面板宽度。
  */
 import { useState, useRef, useEffect } from 'react'
-import { Terminal, FileText, GitCompare, X, Activity } from 'lucide-react'
-import TerminalView from './TerminalView'
+import { FileText, GitCompare, X, Activity, Terminal } from 'lucide-react'
 import FileExplorer from './FileExplorer'
 import CodeReview from './CodeReview'
 import ActivityPanel from './ActivityPanel'
+import TerminalView from './TerminalView'
 
-export type RightPanelTab = 'activity' | 'terminal' | 'files' | 'review'
+export type RightPanelTab = 'activity' | 'files' | 'terminal' | 'review'
 
 interface RightPanelProps {
   projectPath: string | null
@@ -22,10 +22,10 @@ interface RightPanelProps {
   sessionId?: string | null
 }
 
-const TABS: { id: RightPanelTab; label: string; icon: typeof Terminal }[] = [
+const TABS: { id: RightPanelTab; label: string; icon: typeof Activity }[] = [
   { id: 'activity', label: 'Activity', icon: Activity },
-  { id: 'terminal', label: 'Terminal', icon: Terminal },
   { id: 'files', label: 'Files', icon: FileText },
+  { id: 'terminal', label: 'Terminal', icon: Terminal },
   { id: 'review', label: 'Review', icon: GitCompare },
 ]
 
@@ -123,11 +123,11 @@ export default function RightPanel({ projectPath, onClose, convId, sessionId }: 
         <div style={{ display: activeTab === 'activity' ? 'block' : 'none', height: '100%' }}>
           <ActivityPanel convId={convId ?? null} sessionId={sessionId ?? null} cwd={projectPath} />
         </div>
-        <div style={{ display: activeTab === 'terminal' ? 'block' : 'none', height: '100%' }}>
-          <TerminalView projectPath={projectPath} />
-        </div>
         <div style={{ display: activeTab === 'files' ? 'block' : 'none', height: '100%' }}>
           <FileExplorer projectPath={projectPath} />
+        </div>
+        <div style={{ display: activeTab === 'terminal' ? 'block' : 'none', height: '100%' }}>
+          <TerminalView projectPath={projectPath} />
         </div>
         <div style={{ display: activeTab === 'review' ? 'block' : 'none', height: '100%' }}>
           <CodeReview projectPath={projectPath} />

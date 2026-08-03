@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react'
-import type { ReactNode, KeyboardEvent, ClipboardEvent, DragEvent } from 'react'
+import type { KeyboardEvent, ClipboardEvent, DragEvent } from 'react'
 import { ipc } from '../lib/ipc'
 import { ArrowUp, FileCode, Sparkles, FolderOpen, Zap, Trash2, Plus, HelpCircle, Cpu, Square, Copy, Check, Paperclip, Image as ImageIcon, X as XIcon, Brain, Terminal, ChevronDown, AlertTriangle, GitBranch, Loader2 } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { MarkdownContent, CodeBlockView } from '../lib/codeRenderer'
 import type { Message, ModelOption, Attachment, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption, ContentBlock, DiffHunk } from '../types'
 import ControlBar from './ControlBar'
 
@@ -285,93 +284,6 @@ const AttachmentPreview = memo(function AttachmentPreview({
 
 /* ---------- types ---------- */
 
-interface Token {
-  type: 'str' | 'com' | 'num' | 'key' | 'type' | 'fn' | 'ident' | 'ws' | 'punct'
-  value: string
-}
-
-/* ---------- syntax highlighting ---------- */
-
-const KEYWORDS = new Set([
-  'import', 'export', 'const', 'let', 'var', 'function', 'return', 'if', 'else',
-  'try', 'catch', 'finally', 'async', 'await', 'new', 'class', 'extends',
-  'interface', 'type', 'enum', 'public', 'private', 'readonly', 'static',
-  'void', 'null', 'undefined', 'true', 'false', 'as', 'from', 'default',
-  'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'throw',
-  'typeof', 'this', 'super', 'yield', 'delete',
-])
-
-function tokenizeLine(line: string): Token[] {
-  if (!line) return [{ type: 'ws', value: '\u00A0' }]
-  const tokens: Token[] = []
-  const re = /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(\/\/[^\n]*)|(\b\d+(?:\.\d+)?\b)|([A-Za-z_$][A-Za-z0-9_$]*)|(\s+)|([\s\S])/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(line)) !== null) {
-    if (m[1]) tokens.push({ type: 'str', value: m[1] })
-    else if (m[2]) tokens.push({ type: 'com', value: m[2] })
-    else if (m[3]) tokens.push({ type: 'num', value: m[3] })
-    else if (m[4]) {
-      const v = m[4]
-      if (KEYWORDS.has(v)) tokens.push({ type: 'key', value: v })
-      else if (/^[A-Z]/.test(v)) tokens.push({ type: 'type', value: v })
-      else tokens.push({ type: 'ident', value: v })
-    } else if (m[5]) tokens.push({ type: 'ws', value: m[5] })
-    else tokens.push({ type: 'punct', value: m[6] })
-  }
-  for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i].type === 'ident') {
-      let j = i + 1
-      while (j < tokens.length && tokens[j].type === 'ws') j++
-      if (j < tokens.length && tokens[j].value === '(') tokens[i].type = 'fn'
-    }
-  }
-  return tokens
-}
-
-function renderCodeTokens(tokens: Token[]): ReactNode[] {
-  const cls: Record<string, string> = {
-    str: 'tk-str', com: 'tk-com', num: 'tk-num', key: 'tk-key', type: 'tk-type', fn: 'tk-fn',
-  }
-  return tokens.map((t, i) => (
-    <span key={i} className={cls[t.type] || 'tk-var'}>{t.value}</span>
-  ))
-}
-
-
-
-
-const CodeBlockView = memo(function CodeBlockView({ language, code }: { language: string; code: string }) {
-  const lines = code.split('\n')
-  const [copied, setCopied] = useState(false)
-  const copy = () => {
-    navigator.clipboard?.writeText(code).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) }).catch(() => {})
-  }
-  return (
-    <div className="code-block" style={{ margin: '12px 0' }}>
-      <div className="code-header">
-        <div className="flex items-center gap-2">
-          <FileCode size={12} style={{ color: 'var(--accent-bright)' }} />
-          <span style={{ color: 'var(--fg-secondary)', fontWeight: 500 }}>{language || 'text'}</span>
-        </div>
-        <button onClick={copy} className="code-copy" title="Copy code">
-          {copied ? <Check size={12} style={{ color: 'var(--success)' }} /> : <Copy size={12} style={{ color: 'var(--fg-tertiary)' }} />}
-        </button>
-      </div>
-      <div className="code-body" style={{ fontFamily: 'var(--font-mono)' }}>
-        {lines.map((line, i) => (
-          <div key={i} style={{ minHeight: '1.7em', whiteSpace: 'pre' }}>
-            {renderCodeTokens(tokenizeLine(line))}
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-})
-
-
-/* ---------- 内容块渲染组件 ---------- */
-
-/** 思考过程：可折叠，默认折叠，灰色斜体 */
 const ThinkingBlockView = memo(function ThinkingBlockView({ block }: { block: ContentBlock }) {
   const [expanded, setExpanded] = useState(false)
   const text = block.content || ''
@@ -658,27 +570,6 @@ const UserMessage = memo(function UserMessage({ msg, idx }: { msg: Message; idx:
   )
 })
 
-/** 纯文本的 ReactMarkdown 渲染 */
-function MarkdownContent({ text }: { text: string }) {
-  return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        pre: ({ children }) => <>{children}</>,
-        code: ({ className, children }) => {
-          const match = /language-(\w+)/.exec(className || '')
-          if (match) {
-            return <CodeBlockView language={match[1]} code={String(children).replace(/\n$/, '')} />
-          }
-          return <code>{children}</code>
-        },
-      }}
-    >
-      {text}
-    </ReactMarkdown>
-  )
-}
-
 const AssistantMessage = memo(function AssistantMessage({
   msg, idx, onResendWithPermission,
 }: {
@@ -752,8 +643,60 @@ const AssistantMessage = memo(function AssistantMessage({
 function fmtTime(ts: string): string {
   const d = new Date(ts)
   if (isNaN(d.getTime())) return ts
-  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
+ return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
 }
+
+/* ---------- stream activity indicator (above the input) ---------- */
+
+function toolActivityLabel(tool?: string): string {
+  switch (tool) {
+    case 'Read': return 'Reading files…'
+    case 'Write': return 'Writing code…'
+    case 'Edit':
+    case 'MultiEdit': return 'Editing code…'
+    case 'Bash': return 'Running command…'
+    case 'Glob':
+    case 'Grep': return 'Searching…'
+    case 'WebFetch':
+    case 'WebSearch': return 'Searching the web…'
+    case 'TodoWrite': return 'Planning…'
+    default: return tool ? `${tool}…` : 'Working…'
+  }
+}
+
+/** Derive the current backend activity from the streaming message's last block. */
+function deriveStreamActivity(msg: Message | undefined): string | null {
+  if (!msg || msg.role !== 'assistant') return null
+  const blocks = msg.contentBlocks
+  if (!blocks || blocks.length === 0) return 'Thinking…'
+  const last = blocks[blocks.length - 1]
+  switch (last.type) {
+    case 'thinking': return 'Thinking…'
+    case 'text': return 'Responding…'
+    case 'tool_use': return toolActivityLabel(last.toolName)
+    case 'tool_result': return 'Thinking…'
+    case 'permission_denial': return 'Awaiting permission…'
+    default: return 'Working…'
+  }
+}
+
+const StreamActivityBar = memo(function StreamActivityBar({ label }: { label: string | null }) {
+  if (!label) return null
+  return (
+    <div
+      className="flex items-center gap-2 mb-2 px-1 animate-fade-in"
+      style={{ height: 20, color: 'var(--fg-tertiary)', fontFamily: 'var(--font-sans)' }}
+    >
+      <span
+        style={{
+          width: 7, height: 7, borderRadius: '50%', background: 'var(--accent-primary)',
+          animation: 'stream-pulse 1.2s ease-in-out infinite',
+        }}
+      />
+      <span className="text-[12px] font-medium" style={{ letterSpacing: 0.1 }}>{label}</span>
+    </div>
+  )
+})
 
 /* ---------- ChatView ---------- */
 
@@ -927,6 +870,12 @@ export default function ChatView({
     const el = inputRef.current
     if (el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 180) + 'px' }
   }, [inputText])
+
+  // Current backend activity, derived from the streaming message (bar above the input).
+  const streamActivity = useMemo(
+    () => (isStreaming ? deriveStreamActivity(messages[messages.length - 1]) : null),
+    [isStreaming, messages],
+  )
 
   const hasAttachments = attachments.length > 0
   const canSend = (inputText.trim().length > 0 || hasAttachments) && !isStreaming && !isCmdMode
@@ -1263,6 +1212,8 @@ export default function ChatView({
               </div>
             </div>
           )}
+
+          <StreamActivityBar label={streamActivity} />
 
           <div
             className="rounded-2xl overflow-hidden transition-all"

@@ -1,6 +1,6 @@
 export interface Conversation {
   id: string; title: string; projectPath: string | null; model: string;
-  pinned: boolean; claudeSessionId: string | null;
+  pinned: boolean; kind: 'agent' | 'chat'; claudeSessionId: string | null;
   createdAt: string; updatedAt: string; lastMessage: string | null;
 }
 

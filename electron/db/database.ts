@@ -139,5 +139,11 @@ export class AppDatabase {
     if (!has('attachments')) {
       this.db.exec('ALTER TABLE messages ADD COLUMN attachments TEXT');
     }
+    // conversations.kind distinguishes agent (SDK) vs chat (CLI) conversations.
+    const convCols = this.db.prepare('PRAGMA table_info(conversations)').all() as { name: string }[];
+    const hasConv = (name: string) => convCols.some((c) => c.name === name);
+    if (!hasConv('kind')) {
+      this.db.exec("ALTER TABLE conversations ADD COLUMN kind TEXT DEFAULT 'chat'");
+    }
   }
 }

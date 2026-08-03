@@ -62,8 +62,9 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
   const [state, setState] = useState<ClaudeTerminalState>({ status: 'idle' })
   const [showSearch, setShowSearch] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
-  const [showHelp, setShowHelp] = useState(true)
+  const [showHelp, setShowHelp] = useState(false)
   const [permission, setPermission] = useState<{ text: string; options: string[] } | null>(null)
+  const [isFocused, setIsFocused] = useState(false)
 
   const terminalRef = useRef<Terminal | null>(null)
   const fitAddonRef = useRef<FitAddon | null>(null)
@@ -217,7 +218,7 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
       setShowHelp(false)
     })
 
-    // Handle paste: Cmd+V / Ctrl+V
+    // Focus management — track focus state and restore on click
     terminal.attachCustomKeyEventHandler((event: KeyboardEvent) => {
       // Cmd+F / Ctrl+F → toggle search
       if ((event.metaKey || event.ctrlKey) && event.key === 'f') {
@@ -235,6 +236,14 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
       }
       return true
     })
+
+    // Track focus/blur for visual indicator using DOM events
+    // xterm.js creates a hidden textarea for keyboard capture
+    const xtermTextarea = containerRef.current?.querySelector('textarea')
+    if (xtermTextarea) {
+      xtermTextarea.addEventListener('focus', () => setIsFocused(true))
+      xtermTextarea.addEventListener('blur', () => setIsFocused(false))
+    }
 
     // Create backend PTY — only if not already active (StrictMode fix)
     if (!ptyAlreadyActive) {
@@ -284,8 +293,10 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
       rows: terminal.rows,
     }).catch(() => {})
 
-    // Focus
-    setTimeout(() => terminal.focus(), 100)
+    // Focus — aggressive: immediate + delayed to ensure terminal captures keyboard
+    setTimeout(() => terminal.focus(), 50)
+    setTimeout(() => terminal.focus(), 300)
+    setTimeout(() => terminal.focus(), 800)
   }, []) // Empty deps — only run once on mount
 
   /** Restart session */
@@ -596,8 +607,32 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
       )}
 
       {/* Terminal container */}
-      <div className="relative flex-1 min-h-0 overflow-hidden" style={{ background: '#0c0c10' }}>
-        <div ref={containerRef} className="absolute inset-0" />
+      <div
+        className="relative flex-1 min-h-0 overflow-hidden"
+        style={{
+          background: '#0c0c10',
+          cursor: 'text',
+          boxShadow: isFocused ? 'inset 0 0 0 1px rgba(124, 91, 245, 0.15)' : undefined,
+        }}
+        onMouseDown={(e) => {
+          // Re-focus terminal on any click in the container area
+          // Use mouseDown instead of click for immediate focus before key events
+          const term = terminalRef.current
+          if (term && e.target === e.currentTarget) {
+            // Click on container background (not on overlay elements) — focus terminal
+            term.focus()
+          }
+        }}
+      >
+        <div
+          ref={containerRef}
+          className="absolute inset-0"
+          onClick={() => {
+            // Also handle click on the xterm container div for focus
+            const term = terminalRef.current
+            if (term) term.focus()
+          }}
+        />
 
         {/* Permission approval bar — floating above terminal when a permission prompt is detected */}
         {permission && state.status === 'active' && (
@@ -704,29 +739,6 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
         )}
       </div>
 
-      {/* Exit info bar */}
-      {state.status === 'exited' && (
-        <div
-          className="flex items-center justify-center gap-3 px-4 py-3 flex-shrink-0"
-          style={{ borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-surface)' }}
-        >
-          <span className="text-[11px]" style={{ color: 'var(--fg-tertiary)' }}>
-            Session ended. Restart will resume with --resume.
-          </span>
-          <button
-            onClick={restartSession}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium transition-colors"
-            style={{
-              background: 'rgba(124,91,245,0.12)',
-              color: 'var(--accent-bright)',
-              border: '1px solid rgba(124,91,245,0.25)',
-            }}
-          >
-            <RotateCcw size={11} />
-            Restart Session
-          </button>
-        </div>
-      )}
     </div>
   )
 }

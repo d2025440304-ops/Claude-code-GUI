@@ -7,6 +7,7 @@ export interface Conversation {
   projectPath: string | null;
   model: string;
   pinned: boolean;
+  kind: 'agent' | 'chat';
   claudeSessionId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -19,6 +20,7 @@ interface ConversationRow {
   project_path: string | null;
   model: string;
   pinned: number;
+  kind: string;
   claude_session_id: string | null;
   created_at: string;
   updated_at: string;
@@ -58,17 +60,18 @@ export class ConversationRepo {
    * Insert a new conversation and return the fully-populated object.
    * `pinned` defaults to false, timestamps default to now (ISO strings).
    */
-  create(title: string, projectPath: string | null, model: string): Conversation {
+  create(title: string, projectPath: string | null, model: string, kind: 'agent' | 'chat' = 'chat'): Conversation {
     const id = randomUUID();
     const now = new Date().toISOString();
+    const safeKind = kind === 'agent' ? 'agent' : 'chat';
 
     this.db
       .prepare(
         `INSERT INTO conversations
-           (id, title, project_path, model, pinned, claude_session_id, created_at, updated_at, last_message)
-         VALUES (?, ?, ?, ?, 0, NULL, ?, ?, NULL)`,
+           (id, title, project_path, model, pinned, kind, claude_session_id, created_at, updated_at, last_message)
+         VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, NULL)`,
       )
-      .run(id, title, projectPath, model, now, now);
+      .run(id, title, projectPath, model, safeKind, now, now);
 
     return {
       id,
@@ -76,6 +79,7 @@ export class ConversationRepo {
       projectPath,
       model,
       pinned: false,
+      kind: safeKind,
       claudeSessionId: null,
       createdAt: now,
       updatedAt: now,
@@ -145,6 +149,7 @@ export class ConversationRepo {
       projectPath: r.project_path,
       model: r.model,
       pinned: r.pinned === 1,
+      kind: r.kind === 'agent' ? 'agent' : 'chat',
       claudeSessionId: r.claude_session_id,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
