@@ -2,12 +2,12 @@
  * 导入历史对话的只读视图。
  *
  * 用于渲染从 Claude Code（终端/VS Code）导入的历史对话记录，
- * 不支持发送消息或流式输出，仅用于查看。
+ * 支持查看 + 一键"继续对话"（resume 原会话）。
  */
 import { useRef, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { User, Sparkles, Clock, Cpu } from 'lucide-react'
+import { User, Sparkles, Clock, Cpu, MessageSquarePlus } from 'lucide-react'
 
 interface HistoryMessage {
   uuid: string
@@ -23,6 +23,8 @@ interface ImportedChatViewProps {
   title: string
   projectPath: string
   entrypoint: string
+  /** 点击"继续对话"：用该会话的 sessionId 创建 GUI 会话并 resume */
+  onContinue?: () => void
 }
 
 /** 格式化时间戳为可读时间 */
@@ -48,7 +50,7 @@ function formatTokens(n: number): string {
   return String(n)
 }
 
-export default function ImportedChatView({ messages, title, projectPath, entrypoint }: ImportedChatViewProps) {
+export default function ImportedChatView({ messages, title, projectPath, entrypoint, onContinue }: ImportedChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
 
   // 自动滚动到底部
@@ -86,6 +88,22 @@ export default function ImportedChatView({ messages, title, projectPath, entrypo
         <span style={{ color: 'var(--fg-quaternary)' }}>{messages.length} messages</span>
         <div className="w-px h-3" style={{ background: 'var(--border-subtle)' }} />
         <span style={{ color: 'var(--fg-quaternary)' }}>{entrypoint === 'vscode' ? 'VS Code' : 'Terminal'}</span>
+        {/* 继续对话按钮 */}
+        {onContinue && (
+          <button
+            onClick={onContinue}
+            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all"
+            style={{
+              background: 'var(--accent-primary)',
+              color: '#fff',
+              boxShadow: '0 2px 8px rgba(124,91,245,0.35)',
+            }}
+            title="用这个会话的 sessionId 在本应用里继续对话"
+          >
+            <MessageSquarePlus size={12} />
+            Continue conversation
+          </button>
+        )}
       </div>
 
       {/* 消息列表 */}

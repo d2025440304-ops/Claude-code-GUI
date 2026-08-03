@@ -776,6 +776,44 @@ export default function App() {
     }
   }, [abortActiveStream])
 
+  /* ---- 从历史会话续接（终端/其他客户端 → 本应用继续 build） ---- */
+  const resumeHistoryConversation = useCallback(async () => {
+    if (!historyDetail) return
+    abortActiveStream()
+    try {
+      // 用历史会话的 sessionId + 项目路径创建 GUI 会话：
+      // - Chat 模式：发送时 cli-spawner 会 --resume 该 session（复用完整上下文）
+      // - Agent 模式：AGENT_CREATE 传 resumeSessionId，SDK 首次发送走 resume
+      const conv = await ipc.invoke<Conversation>('conversation:create', {
+        title: historyDetail.title || 'Resumed from terminal',
+        projectPath: historyDetail.projectPath,
+        model: selectedModel,
+        kind: viewMode,
+        claudeSessionId: historyDetail.sessionId,
+      })
+      setConversations((prev) => [conv, ...prev])
+      // 把历史消息持久化到该会话，这样 UI 立即有完整上下文（重启后也保留）
+      try {
+        await ipc.invoke('conversation:import-messages', {
+          conversationId: conv.id,
+          messages: historyDetail.messages
+            .filter((m) => m.content && m.content.trim())
+            .map((m) => ({ role: m.role, content: m.content })),
+        })
+      } catch { /* 导入失败不阻塞续接 */ }
+      // 切换到新会话
+      setActiveConvId(conv.id)
+      setActiveHistoryId(null)
+      setHistoryDetail(null)
+      setError(null)
+      if (conv.projectPath) setExpandedProjects((prev) => new Set(prev).add(conv.projectPath!))
+    } catch (e) {
+      console.error('Failed to resume history conversation:', e)
+      setError('Failed to resume conversation')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyDetail, selectedModel, viewMode, abortActiveStream])
+
   /* ---- send message ---- */
   const handleSend = async (text: string, attachments: Attachment[] = []) => {
     if (!activeConvId || isStreaming) return
@@ -1382,6 +1420,7 @@ export default function App() {
             title={historyDetail.title}
             projectPath={historyDetail.projectPath}
             entrypoint={historyDetail.entrypoint}
+            onContinue={resumeHistoryConversation}
           />
         ) : activeHistoryId && loadingHistory ? (
           <div className="flex-1 flex items-center justify-center">
@@ -1410,6 +1449,7 @@ export default function App() {
               }
             }}
             onOpenActivity={() => setRightPanelOpen(true)}
+            resumeSessionId={activeConv?.claudeSessionId}
           />
         ) : viewMode === 'agent' ? (
           /* Agent mode with no conversation selected — show placeholder */

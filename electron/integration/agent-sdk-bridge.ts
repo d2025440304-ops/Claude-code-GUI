@@ -135,6 +135,8 @@ export interface BridgeSessionOptions {
    * [] = 禁用全部 skills；string[] = 只加载列出的。
    */
   skills?: string[];
+  /** 从外部会话（终端 CLI 等）续接：首次发送时 resume 这个 session id。 */
+  resumeSessionId?: string;
 }
 
 interface PendingPermission {
@@ -252,8 +254,10 @@ export class AgentSdkBridge {
     // SDK 在 system(init) 消息中返回真实 session_id（handleSystemMessage 里赋值）。
     // 若本轮 query 失败（从未创建 session），state.sessionId 保持 null，
     // 下一轮会重新生成新 UUID 走首次创建路径，而不是 resume 一个不存在的 session。
-    const isFirstMessage = !state.sessionId;
-    const sessionId = state.sessionId || randomUUID();
+    // resumeSessionId：从外部会话（终端 CLI 等）续接时，首次发送走 resume 路径
+    const resumeSession = state.options.resumeSessionId;
+    const isFirstMessage = !state.sessionId && !resumeSession;
+    const sessionId = state.sessionId || resumeSession || randomUUID();
 
     // Attachments → 用 AsyncIterable<SDKUserMessage> 直接传 image content block
     // （字符串 prompt 不经过 @ 引用预处理，图片必须走 content block）

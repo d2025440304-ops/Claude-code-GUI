@@ -49,6 +49,8 @@ interface AgentConversationViewProps {
   onThinkingEffortChange?: (effort: ThinkingEffort) => void;
   onSessionIdChange?: (sessionId: string | null) => void;
   onOpenActivity?: () => void;
+  /** 从外部会话（终端 CLI 等）续接：AGENT_CREATE 时传给 bridge 用于首次 resume */
+  resumeSessionId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +135,7 @@ export default function AgentConversationView({
   onThinkingEffortChange,
   onSessionIdChange,
   onOpenActivity,
+  resumeSessionId,
 }: AgentConversationViewProps) {
   const [status, setStatus] = useState<AgentStatus>('idle');
   const [blocks, setBlocks] = useState<AgentMessageBlock[]>([]);
@@ -216,6 +219,7 @@ export default function AgentConversationView({
         model,
         permissionMode,
         thinkingEffort,
+        ...(resumeSessionId ? { resumeSessionId } : {}),
       });
       // If the session is actively running (switched away mid-turn),
       // only restore user_text + completed tool_use blocks to show context.

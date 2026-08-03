@@ -31,6 +31,7 @@ export const Channels = {
   CONVERSATION_BRANCH: 'conversation:branch',
   CONVERSATION_SET_MODEL: 'conversation:set-model',
   CONVERSATION_SET_SESSION_ID: 'conversation:set-session-id',
+  CONVERSATION_IMPORT_MESSAGES: 'conversation:import-messages',
 
   // Messages
   MESSAGE_LIST: 'message:list',

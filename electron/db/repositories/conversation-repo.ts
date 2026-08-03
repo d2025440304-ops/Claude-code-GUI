@@ -59,8 +59,9 @@ export class ConversationRepo {
   /**
    * Insert a new conversation and return the fully-populated object.
    * `pinned` defaults to false, timestamps default to now (ISO strings).
+   * `claudeSessionId` 用于从外部会话（终端 CLI 等）续接 — 传入历史 session id。
    */
-  create(title: string, projectPath: string | null, model: string, kind: 'agent' | 'chat' = 'chat'): Conversation {
+  create(title: string, projectPath: string | null, model: string, kind: 'agent' | 'chat' = 'chat', claudeSessionId: string | null = null): Conversation {
     const id = randomUUID();
     const now = new Date().toISOString();
     const safeKind = kind === 'agent' ? 'agent' : 'chat';
@@ -68,10 +69,10 @@ export class ConversationRepo {
     this.db
       .prepare(
         `INSERT INTO conversations
-           (id, title, project_path, model, pinned, kind, claude_session_id, created_at, updated_at, last_message)
-         VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, NULL)`,
+          (id, title, project_path, model, pinned, kind, claude_session_id, created_at, updated_at, last_message)
+        VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
       )
-      .run(id, title, projectPath, model, safeKind, now, now);
+      .run(id, title, projectPath, model, safeKind, claudeSessionId, now, now);
 
     return {
       id,
@@ -80,7 +81,7 @@ export class ConversationRepo {
       model,
       pinned: false,
       kind: safeKind,
-      claudeSessionId: null,
+      claudeSessionId,
       createdAt: now,
       updatedAt: now,
       lastMessage: null,

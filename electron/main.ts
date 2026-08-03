@@ -479,6 +479,8 @@ interface ConversationCreatePayload {
   projectPath?: string | null;
   model?: string;
   kind?: 'agent' | 'chat';
+  /** 从外部会话（终端 CLI 等）续接时传入历史 session id */
+  claudeSessionId?: string | null;
 }
 
 interface ConversationIdPayload {
@@ -523,9 +525,34 @@ function registerIpcHandlers(): void {
      const title = payload.title?.trim() || 'New Conversation';
       const projectPath = payload.projectPath ?? null;
       const model = payload.model || DEFAULT_MODEL;
-      const conv = conversationRepo.create(title, projectPath, model, payload.kind || 'chat');
+      const conv = conversationRepo.create(title, projectPath, model, payload.kind || 'chat', payload.claudeSessionId ?? null);
       broadcast(Channels.CONVERSATIONS_CHANGED);
       return conv;
+    },
+  );
+
+  // 批量导入历史消息（从终端 CLI 会话续接时，把历史消息持久化到 GUI 会话）
+  ipcMain.handle(
+    'conversation:import-messages',
+    (_e: IpcMainInvokeEvent, payload: {
+      conversationId: string;
+      messages: Array<{ role: string; content: string; timestamp?: string }>;
+    }): { ok: boolean; count: number } => {
+      try {
+        let count = 0;
+        for (const m of payload.messages) {
+          messageRepo.create(payload.conversationId, m.role, m.content, []);
+          count++;
+        }
+        conversationRepo.updateLastMessage(
+          payload.conversationId,
+          payload.messages[payload.messages.length - 1]?.content?.slice(0, 120) || '',
+        );
+        return { ok: true, count };
+      } catch (err) {
+        console.error('[Main] Failed to import messages:', err);
+        return { ok: false, count: 0 };
+      }
     },
   );
 
@@ -1311,6 +1338,8 @@ function registerIpcHandlers(): void {
       model?: string;
       permissionMode?: string;
       thinkingEffort?: string;
+      /** 从外部会话（终端 CLI 等）续接：首次发送时 resume 这个 session */
+      resumeSessionId?: string;
     }): { ok: boolean; sessionStatus: string } => {
       const settings = loadSettings();
       agentBridge.createSession(payload.convId, {
@@ -1319,6 +1348,7 @@ function registerIpcHandlers(): void {
         permissionMode: payload.permissionMode as any,
         thinkingEffort: payload.thinkingEffort as any,
         apiKey: settings.apiKey as string | undefined,
+        resumeSessionId: payload.resumeSessionId,
         // skills 总开关：false → 传 []（禁用全部）；默认不传（全部加载）
         ...(settings.skillsEnabled === false ? { skills: [] } : {}),
       });
