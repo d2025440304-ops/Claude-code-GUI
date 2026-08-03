@@ -2,12 +2,13 @@
  * 文件浏览组件 — 左右分栏布局。
  *
  * 左侧：文件树
- * 右侧：代码预览
+ * 右侧：代码预览（.md 文件使用 Markdown 渲染）
  * 中间：可拖拽分隔条
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Folder, FolderOpen, File, FileCode, FileText, FileJson, Image, Loader2, ChevronRight, RefreshCw } from 'lucide-react'
+import { Folder, FolderOpen, File, FileCode, FileText, FileJson, Image, Loader2, ChevronRight, RefreshCw, BookOpen } from 'lucide-react'
 import { ipc, Channels } from '../lib/ipc';
+import { MarkdownContent } from '../lib/codeRenderer';
 
 interface FileEntry {
   name: string
@@ -30,6 +31,8 @@ function getFileIcon(name: string, isDir: boolean) {
     return <FileJson size={13} className="text-[var(--fg-tertiary)]" />
   if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext))
     return <Image size={13} className="text-[var(--fg-tertiary)]" />
+  if (['md', 'mdx', 'markdown'].includes(ext))
+    return <BookOpen size={13} style={{ color: 'var(--accent-bright)' }} />
   return <FileText size={13} className="text-[var(--fg-tertiary)]" />
 }
 
@@ -270,16 +273,27 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
               className="flex items-center gap-2 px-3 py-1.5 flex-shrink-0"
               style={{ borderBottom: '1px solid var(--border-subtle)', background: 'var(--bg-surface)' }}
             >
-              <File size={11} className="text-[var(--fg-quaternary)]" />
+              {fileName.endsWith('.md') ? (
+                <BookOpen size={11} style={{ color: 'var(--accent-bright)' }} />
+              ) : (
+                <File size={11} className="text-[var(--fg-quaternary)]" />
+              )}
               <span className="text-[11px] font-mono truncate" style={{ color: 'var(--fg-secondary)' }}>
                 {fileName}
               </span>
+              {fileName.endsWith('.md') && (
+                <span className="tag ml-auto" style={{ fontSize: 9, padding: '1px 5px' }}>Markdown</span>
+              )}
             </div>
             {/* 文件内容 */}
             <div className="flex-1 overflow-auto">
               {loadingFile ? (
                 <div className="flex items-center justify-center py-4">
                   <Loader2 size={14} className="animate-spin text-[var(--fg-quaternary)]" />
+                </div>
+              ) : fileName.endsWith('.md') && fileContent ? (
+                <div className="prose px-6 py-5">
+                  <MarkdownContent text={fileContent} />
                 </div>
               ) : (
                 <pre

@@ -965,8 +965,21 @@ export default function App() {
         {/* Logo / brand header */}
         <div className="px-4 pb-3">
           <div className="flex items-center gap-3 mb-5">
-            <div className="logo-mark" style={{ width: 30, height: 30, borderRadius: '10px' }}>
-              <Sparkles size={15} color="#fff" strokeWidth={2} />
+            <div
+              style={{
+                width: 32, height: 32, borderRadius: 10,
+                background: 'linear-gradient(145deg, #7c5bf5 0%, #a78bfa 40%, #c084fc 100%)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                boxShadow: '0 2px 12px rgba(124,91,245,0.35), 0 0 0 1px rgba(255,255,255,0.06)',
+                position: 'relative',
+              }}
+            >
+              {/* C + terminal mark */}
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" strokeWidth="1.5" />
+                <path d="M8 9l3 3-3 3" />
+                <path d="M14 15h3" />
+              </svg>
             </div>
             <div className="flex flex-col">
               <span className="text-[15px] font-semibold" style={{ color: 'var(--fg-primary)', letterSpacing: '-0.025em', lineHeight: 1.2 }}>
@@ -1645,8 +1658,19 @@ export default function App() {
                     {/* ── About ── */}
                     {settingsTab === 'About' && (
                       <div className="flex flex-col items-center text-center py-4 gap-3">
-                        <div className="logo-mark" style={{ width: 40, height: 40, borderRadius: 12 }}>
-                          <Sparkles size={18} style={{ color: '#fff' }} />
+                        <div
+                          style={{
+                            width: 44, height: 44, borderRadius: 14,
+                            background: 'linear-gradient(145deg, #7c5bf5 0%, #a78bfa 40%, #c084fc 100%)',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            boxShadow: '0 4px 16px rgba(124,91,245,0.35)',
+                          }}
+                        >
+                          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="12" cy="12" r="10" strokeWidth="1.5" />
+                            <path d="M8 9l3 3-3 3" />
+                            <path d="M14 15h3" />
+                          </svg>
                         </div>
                         <div>
                           <div className="text-[14px] font-semibold" style={{ color: 'var(--fg-primary)' }}>Claude Code Desktop</div>
