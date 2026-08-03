@@ -12,9 +12,10 @@
  * NOTE: The @anthropic-ai/claude-agent-sdk is an ESM-only package. Since the
  * Electron main process runs as CommonJS, we lazy-load it via dynamic import().
  */
-import type { SDKMessage, PermissionResult, Query as SDKQuery } from '@anthropic-ai/claude-agent-sdk';
+import type { SDKMessage, PermissionResult, Query as SDKQuery, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
+import path from 'path';
 import { resolveCwd } from './resolve-cwd';
 import type {
   AgentStatus,
@@ -23,6 +24,17 @@ import type {
   FileChangeRecord,
   AgentBridgeSession,
 } from '../types/agent';
+
+/** Attachment shape received from the renderer via main. */
+export interface BridgeAttachment {
+  id: string;
+  kind: 'image' | 'file';
+  name: string;
+  size: number;
+  mimeType?: string;
+  dataUrl?: string;
+  path?: string;
+}
 
 // Lazy-loaded SDK query function (loaded on first sendMessage call).
 type SdkQueryFn = typeof import('@anthropic-ai/claude-agent-sdk').query;
@@ -38,15 +50,72 @@ const dynamicImport = new Function('specifier', 'return import(specifier)') as <
 
 async function ensureSdk(): Promise<SdkQueryFn> {
   if (sdkQuery) return sdkQuery;
-  if (sdkLoadError) throw sdkLoadError;
+  // A3 修复：不再永久缓存加载错误 — 每次调用都重试动态 import，
+  // 只有明确成功才缓存 query。SDK 临时不可用（如首次 npm install 后）
+  // 不再需要重启应用才能恢复。
   try {
     const mod = await dynamicImport('@anthropic-ai/claude-agent-sdk');
     sdkQuery = (mod as any).query;
+    sdkLoadError = null;
     return sdkQuery!;
   } catch (err) {
     sdkLoadError = err instanceof Error ? err : new Error(String(err));
     throw sdkLoadError;
   }
+}
+
+/**
+ * 构建 query 的 prompt。
+ *
+ * 关键：Agent SDK 的 `query()` 支持 `prompt: string | AsyncIterable<SDKUserMessage>`。
+ * 字符串 prompt 不会经过 CLI 的 @引用预处理器 —— 之前用 `@/tmp/xxx.png` 传图片
+ * 模型根本看不到（就是用户遇到的"不能直接看到"）。
+ *
+ * 正确做法：有附件时用 AsyncIterable<SDKUserMessage>，直接把图片作为
+ * `image` content block（base64）传给模型，与原生 Claude Code CLI 行为一致。
+ * 文件附件则作为 text 块给出路径（agent 会用 Read 工具自行读取，并受
+ * additionalDirectories 权限约束）。
+ */
+function buildPrompt(
+  text: string,
+  attachments: BridgeAttachment[],
+): string | AsyncIterable<SDKUserMessage> {
+  const images = attachments.filter((a) => a.kind === 'image' && a.dataUrl);
+  const files = attachments.filter((a) => a.kind === 'file' && a.path);
+
+  // 无附件 → 保持简单字符串 prompt（与之前行为一致）
+  if (images.length === 0 && files.length === 0) {
+    return text;
+  }
+
+  const content: SDKUserMessage['message']['content'] = [];
+  // 文本内容（可能为空 → 给个占位避免空 content）
+  content.push({ type: 'text', text: text || '（附带了图片/文件，请查看）' });
+  // 图片 → image content block（base64）
+  for (const img of images) {
+    const m = /^data:([^;]+);base64,(.+)$/.exec(img.dataUrl!);
+    if (!m) continue;
+    content.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: m[1] as 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp',
+        data: m[2],
+      },
+    });
+  }
+  // 文件 → text 块给出路径（agent 用 Read 读取）
+  for (const f of files) {
+    content.push({ type: 'text', text: `[附件文件] ${f.path}` });
+  }
+
+  return (async function* () {
+    yield {
+      type: 'user',
+      message: { role: 'user', content },
+      parent_tool_use_id: null,
+    } satisfies SDKUserMessage;
+  })();
 }
 
 
@@ -61,6 +130,11 @@ export interface BridgeSessionOptions {
   thinkingEffort?: 'none' | 'low' | 'medium' | 'high';
   apiKey?: string;
   additionalDirectories?: string[];
+  /**
+   * Skills 过滤。undefined = 不传（CLI 默认全部加载）；
+   * [] = 禁用全部 skills；string[] = 只加载列出的。
+   */
+  skills?: string[];
 }
 
 interface PendingPermission {
@@ -75,6 +149,9 @@ interface PendingPermission {
     displayName?: string;
     suggestions?: unknown[];
   };
+  /** A7 修复：保存 abort 监听器与 signal，权限响应后移除，避免长会话累积泄漏。 */
+  signal?: AbortSignal;
+  abortListener?: () => void;
 }
 
 interface SessionState {
@@ -162,7 +239,7 @@ export class AgentSdkBridge {
   // Send message (core multi-turn logic)
   // -------------------------------------------------------------------------
 
-  async sendMessage(convId: string, text: string): Promise<void> {
+  async sendMessage(convId: string, text: string, attachments: BridgeAttachment[] = []): Promise<void> {
     const state = this.getSession(convId);
     if (state.status !== 'idle' && state.status !== 'completed') {
       throw new Error(`Cannot send message: agent is ${state.status}`);
@@ -171,10 +248,26 @@ export class AgentSdkBridge {
     const abortController = new AbortController();
     state.abortController = abortController;
 
-    // Build query options
+    // A2 修复：sessionId 不再提前写入 state。
+    // SDK 在 system(init) 消息中返回真实 session_id（handleSystemMessage 里赋值）。
+    // 若本轮 query 失败（从未创建 session），state.sessionId 保持 null，
+    // 下一轮会重新生成新 UUID 走首次创建路径，而不是 resume 一个不存在的 session。
     const isFirstMessage = !state.sessionId;
     const sessionId = state.sessionId || randomUUID();
-    state.sessionId = sessionId;
+
+    // Attachments → 用 AsyncIterable<SDKUserMessage> 直接传 image content block
+    // （字符串 prompt 不经过 @ 引用预处理，图片必须走 content block）
+    const prompt = buildPrompt(text, attachments);
+
+    // 文件附件可能位于 cwd 之外 — 授予这些目录的读取权限（agent 用 Read 时免询问）
+    let additionalDirectories = state.options.additionalDirectories || [];
+    const fileDirs = attachments
+      .filter((a) => a.kind === 'file' && a.path)
+      .map((a) => path.dirname(a.path!))
+      .filter((d) => path.resolve(d) !== path.resolve(state.options.cwd));
+    for (const dir of fileDirs) {
+      if (!additionalDirectories.includes(dir)) additionalDirectories = [...additionalDirectories, dir];
+    }
 
     this.setStatus(convId, 'requesting');
 
@@ -183,7 +276,7 @@ export class AgentSdkBridge {
       const query = await ensureSdk();
 
       const queryResult = query({
-        prompt: text,
+        prompt,
         options: {
           cwd: state.options.cwd,
           model: state.options.model && state.options.model !== 'default' ? state.options.model : undefined,
@@ -195,7 +288,9 @@ export class AgentSdkBridge {
           ...(isFirstMessage
             ? { sessionId }
             : { resume: sessionId }),
-          ...(state.options.additionalDirectories ? { additionalDirectories: state.options.additionalDirectories } : {}),
+          ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
+          // skills 过滤：undefined = 全部加载；[] = 全部禁用；string[] = 白名单
+          ...(state.options.skills !== undefined ? { skills: state.options.skills } : {}),
           canUseTool: (toolName, input, options) => this.handleCanUseTool(convId, toolName, input, options),
           ...(state.options.apiKey ? {
             env: { ...process.env, ANTHROPIC_API_KEY: state.options.apiKey },
@@ -204,6 +299,9 @@ export class AgentSdkBridge {
       });
 
       state.query = queryResult;
+
+      // 拉取会话真实可用 skills（supportedCommands），推给 renderer 命令面板
+      this.refreshSkills(convId, queryResult);
 
       // Iterate through the async generator
       for await (const msg of queryResult) {
@@ -586,13 +684,13 @@ export class AgentSdkBridge {
         displayName: options.displayName,
         suggestions: options.suggestions as unknown[],
       };
-      state.pendingPermissions.set(options.requestId, { resolve, reject, request });
-
-      // Listen for abort
-      options.signal.addEventListener('abort', () => {
+      // A7 修复：保存 abort 监听器引用，respondPermission 时移除
+      const abortListener = () => {
         state.pendingPermissions.delete(options.requestId);
         reject(new Error('Aborted'));
-      });
+      };
+      options.signal.addEventListener('abort', abortListener);
+      state.pendingPermissions.set(options.requestId, { resolve, reject, request, signal: options.signal, abortListener });
     });
   }
 
@@ -604,6 +702,10 @@ export class AgentSdkBridge {
     const pending = state.pendingPermissions.get(decision.requestId);
     if (!pending) return;
 
+    // A7 修复：从 AbortSignal 上移除 abort 监听器，避免长会话累积泄漏
+    if (pending.abortListener) {
+      try { pending.signal?.removeEventListener('abort', pending.abortListener); } catch { /* ignore */ }
+    }
     state.pendingPermissions.delete(decision.requestId);
 
     if (decision.behavior === 'allow') {
@@ -620,6 +722,32 @@ export class AgentSdkBridge {
 
     // Restore status to requesting (the SDK will continue processing)
     this.setStatus(convId, 'requesting');
+  }
+
+  // -------------------------------------------------------------------------
+  // Skills discovery (SDK supportedCommands)
+  // -------------------------------------------------------------------------
+
+  /**
+   * 通过当前 query 拉取会话真实可用的 skills / slash 命令并 emit。
+   * 用 query 引用来防止旧 query 的结果覆盖新会话的状态。
+   */
+  private async refreshSkills(convId: string, query: SDKQuery): Promise<void> {
+    const state = this.sessions.get(convId);
+    if (!state) return;
+    try {
+      const cmds = await query.supportedCommands();
+      // 确保这个 query 仍然是当前 query（防止竞态：旧 query 的响应覆盖新会话）
+      if (this.sessions.get(convId)?.query !== query) return;
+      this.emit(convId, {
+        type: 'skills',
+        sessionId: state.sessionId || '',
+        timestamp: Date.now(),
+        skills: cmds.map((c) => ({ name: c.name, description: c.description })),
+      });
+    } catch {
+      // supportedCommands 可能失败（会话已结束等）— 静默忽略
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -643,11 +771,15 @@ export class AgentSdkBridge {
 
     // Reject all pending permissions
     for (const [, pending] of state.pendingPermissions) {
+      if (pending.abortListener) {
+        try { pending.signal?.removeEventListener('abort', pending.abortListener); } catch { /* ignore */ }
+      }
       pending.reject(new Error('Aborted by user'));
     }
     state.pendingPermissions.clear();
 
-    this.setStatus(convId, 'idle');
+    // A14 修复：abort 后设为 'aborted' 而非 'idle'，UI 能区分自然完成与用户中止
+    this.setStatus(convId, 'aborted');
   }
 
   // -------------------------------------------------------------------------
@@ -667,14 +799,20 @@ export class AgentSdkBridge {
   }
 
   /**
-   * Return the pending permission request for a session (if any), so the
-   * renderer can restore the permission UI after a remount / tab switch.
+   * A4 修复：返回该会话所有 pending 的权限请求（数组），
+   * 而不是只返回第一个。渲染端用队列逐个展示，避免多权限并发时
+   * 后续请求无 UI 处理导致 agent 永久挂起。
    */
-  getPendingPermission(convId: string): PendingPermission['request'] | null {
+  getPendingPermissions(convId: string): PendingPermission['request'][] {
     const state = this.sessions.get(convId);
-    if (!state || state.pendingPermissions.size === 0) return null;
-    const first = state.pendingPermissions.values().next();
-    return first.done ? null : first.value.request;
+    if (!state || state.pendingPermissions.size === 0) return [];
+    return Array.from(state.pendingPermissions.values()).map((p) => p.request);
+  }
+
+  /** Backward-compatible single lookup (returns first pending or null). */
+  getPendingPermission(convId: string): PendingPermission['request'] | null {
+    const all = this.getPendingPermissions(convId);
+    return all.length > 0 ? all[0] : null;
   }
 
   /** Update session options mid-conversation (e.g. model/permission/thinking changes). */

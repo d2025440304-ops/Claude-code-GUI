@@ -114,6 +114,9 @@ export const Channels = {
   FILE_LIST: 'file:list',
   FILE_READ: 'file:read',
 
+  // Skills
+  SKILLS_LIST: 'skills:list',
+
   // Git diff
   GIT_DIFF: 'git:diff',
 

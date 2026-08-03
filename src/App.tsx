@@ -260,7 +260,28 @@ export default function App() {
     onConfirm: () => void
   } | null>(null)
   // 设置面板 Tab
-  const [settingsTab, setSettingsTab] = useState<'General' | 'API' | 'Shortcuts' | 'About'>('General')
+  const [settingsTab, setSettingsTab] = useState<'General' | 'API' | 'Shortcuts' | 'About' | 'Skills'>('General')
+  // Skills 设置：总开关 + 扫描到的 skills
+  const [skillsEnabled, setSkillsEnabled] = useState(true)
+  const [scannedSkills, setScannedSkills] = useState<{ name: string; description: string; source: 'user' | 'project'; path: string }[]>([])
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        const res = await ipc.invoke<{ value: unknown }>('settings:get', { key: 'skillsEnabled' })
+        if (!cancelled && res?.value !== undefined) setSkillsEnabled(res.value === true)
+      } catch { /* ignore */ }
+      // 扫描 user + project 级 skills（project 路径取当前所有会话的项目目录）
+      try {
+        const paths = Array.from(new Set(conversations.map((c) => c.projectPath).filter(Boolean))) as string[]
+        const res = await ipc.invoke<{ skills: { name: string; description: string; source: 'user' | 'project'; path: string }[] }>('skills:list', { projectPaths: paths })
+        if (!cancelled && res?.skills) setScannedSkills(res.skills)
+      } catch { /* ignore */ }
+    }
+    load()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showSettings])
 
   // Claude Code 历史对话
   const [historyConvs, setHistoryConvs] = useState<HistoryConversation[]>([])
@@ -465,6 +486,19 @@ export default function App() {
     window.addEventListener('ccd:switch-conv', handler);
     return () => window.removeEventListener('ccd:switch-conv', handler);
   }, [selectConversation]);
+
+  /* ---- slash command events (Agent 模式 /new /clear) ---- */
+  useEffect(() => {
+    const newHandler = () => { handleNewChat() };
+    const clearHandler = () => { confirmClearChat() };
+    window.addEventListener('ccd:new-chat', newHandler);
+    window.addEventListener('ccd:clear-conv', clearHandler);
+    return () => {
+      window.removeEventListener('ccd:new-chat', newHandler);
+      window.removeEventListener('ccd:clear-conv', clearHandler);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /* ---- subscribe to stream events ---- */
   useEffect(() => {
@@ -1483,7 +1517,7 @@ export default function App() {
 
       {/* Settings modal */}
       {showSettings && (() => {
-              const settingsTabs = ['General', 'API', 'Shortcuts', 'About'] as const
+              const settingsTabs = ['General', 'Skills', 'API', 'Shortcuts', 'About'] as const
               return (
               <>
                 <div
@@ -1570,6 +1604,108 @@ export default function App() {
                           </div>
                           {cliInfo?.error && (
                             <div className="text-[11px] mt-1.5" style={{ color: 'var(--danger)' }}>{cliInfo.error}</div>
+                          )}
+                        </div>
+                      </>
+                    )}
+
+                    {/* ── Skills ── */}
+                    {settingsTab === 'Skills' && (
+                      <>
+                        {/* 总开关 */}
+                        <div>
+                          <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>Skills</div>
+                          <div
+                            className="flex items-center justify-between px-3.5 py-3 rounded-xl transition-all cursor-pointer"
+                            style={{ background: 'var(--bg-surface-2)', border: '1px solid var(--border-default)' }}
+                            onClick={() => {
+                              const next = !skillsEnabled
+                              setSkillsEnabled(next)
+                              ipc.invoke('settings:set', { key: 'skillsEnabled', value: next }).catch(() => {})
+                            }}
+                          >
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-[12.5px] font-medium" style={{ color: 'var(--fg-primary)' }}>Enable skills</span>
+                              <span className="text-[11px]" style={{ color: 'var(--fg-tertiary)' }}>
+                                加载 ~/.claude/skills 与项目 .claude/skills 的自定义 skills
+                              </span>
+                            </div>
+                            <div
+                              style={{
+                                width: 34, height: 20, borderRadius: 10, flexShrink: 0,
+                                background: skillsEnabled ? 'var(--accent-primary)' : 'var(--bg-surface-3)',
+                                position: 'relative', transition: 'background 200ms ease',
+                              }}
+                            >
+                              <div
+                                style={{
+                                  position: 'absolute', top: 2, width: 16, height: 16, borderRadius: '50%',
+                                  background: '#fff', transition: 'left 200ms ease',
+                                  left: skillsEnabled ? 16 : 2,
+                                }}
+                              />
+                            </div>
+                          </div>
+                          <div className="text-[11px] mt-2 leading-relaxed" style={{ color: 'var(--fg-quaternary)' }}>
+                            内置 skills（code-review、verify、deep-research 等）随 Claude CLI 提供；关闭后全部不加载。改动对新会话生效。
+                          </div>
+                        </div>
+
+                        {/* 已发现的 skills */}
+                        <div>
+                          <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>
+                            Discovered ({scannedSkills.length})
+                          </div>
+                          {scannedSkills.length === 0 ? (
+                            <div
+                              className="flex flex-col items-center gap-2 py-8 rounded-xl"
+                              style={{ background: 'var(--bg-surface-2)', border: '1px dashed var(--border-default)' }}
+                            >
+                              <Sparkles size={18} className="text-[var(--fg-quaternary)]" />
+                              <span className="text-[11.5px]" style={{ color: 'var(--fg-tertiary)' }}>
+                                没有发现自定义 skills
+                              </span>
+                              <span className="text-[10.5px] px-4 text-center" style={{ color: 'var(--fg-quaternary)' }}>
+                                在 ~/.claude/skills/&lt;name&gt;/SKILL.md 或项目 .claude/skills/&lt;name&gt;/SKILL.md
+                                创建后会自动出现在这里
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="flex flex-col gap-2">
+                              {scannedSkills.map((skill) => (
+                                <div
+                                  key={skill.name}
+                                  className="flex items-center gap-3 px-3.5 py-2.5 rounded-xl"
+                                  style={{ background: 'var(--bg-surface-2)', border: '1px solid var(--border-default)' }}
+                                >
+                                  <div className="flex-shrink-0 w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: 'rgba(124,91,245,0.12)' }}>
+                                    <Sparkles size={13} style={{ color: 'var(--accent-bright)' }} />
+                                  </div>
+                                  <div className="flex-1 min-w-0">
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[12.5px] font-medium font-mono" style={{ color: 'var(--fg-primary)' }}>
+                                        {skill.name}
+                                      </span>
+                                      <span
+                                        className="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded"
+                                        style={{
+                                          color: skill.source === 'user' ? 'var(--accent-bright)' : 'var(--fg-tertiary)',
+                                          background: skill.source === 'user' ? 'rgba(124,91,245,0.12)' : 'var(--tint-subtle)',
+                                          letterSpacing: '0.04em',
+                                        }}
+                                      >
+                                        {skill.source}
+                                      </span>
+                                    </div>
+                                    {skill.description && (
+                                      <div className="text-[11px] truncate mt-0.5" style={{ color: 'var(--fg-tertiary)' }}>
+                                        {skill.description}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
                           )}
                         </div>
                       </>

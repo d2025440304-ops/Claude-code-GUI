@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Loader2, Brain, Wrench, Shield, AlertCircle, RotateCcw, GitBranch } from 'lucide-react';
 import { ipc, Channels } from '../lib/ipc';
-import type { Conversation } from '../types';
+import type { Conversation, Attachment } from '../types';
 import type { ModelOption, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption } from '../types';
 import AgentChatInput from './AgentChatInput';
 import AgentPermissionBar from './AgentPermissionBar';
@@ -136,6 +136,9 @@ export default function AgentConversationView({
 }: AgentConversationViewProps) {
   const [status, setStatus] = useState<AgentStatus>('idle');
   const [blocks, setBlocks] = useState<AgentMessageBlock[]>([]);
+  // A4 修复：权限请求改为队列管理 — 并发多个权限请求时逐个展示，
+  // 响应一个再显示下一个，避免后续请求无 UI 处理导致 agent 挂起。
+  const [permissionQueue, setPermissionQueue] = useState<PermissionRequestData[]>([]);
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequestData | null>(null);
   const permissionRequestRef = useRef<PermissionRequestData | null>(null);
   permissionRequestRef.current = permissionRequest;
@@ -143,6 +146,11 @@ export default function AgentConversationView({
   const [error, setError] = useState<string | null>(null);
   const [statusLabel, setStatusLabel] = useState<string>('');
   const [statusToolName, setStatusToolName] = useState<string>('');
+  // /cost 与回合结束后的用量展示
+  const [usageInfo, setUsageInfo] = useState<{ costUsd: number; durationMs: number; numTurns: number } | null>(null);
+  const [showUsage, setShowUsage] = useState(false);
+  // 会话真实可用的 skills（SDK supportedCommands 推送）
+  const [availableSkills, setAvailableSkills] = useState<{ name: string; description: string }[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
 
@@ -247,8 +255,11 @@ export default function AgentConversationView({
         // Only restore pending permission for idle sessions (active ones
         // will fire permission_request events in real-time).
         try {
-          const pending = await ipc.invoke<PermissionRequestData | null>(Channels.AGENT_GET_PENDING_PERMISSION, { convId: conversationId });
-          if (pending) setPermissionRequest(pending);
+          const pending = await ipc.invoke<PermissionRequestData[]>(Channels.AGENT_GET_PENDING_PERMISSION, { convId: conversationId });
+          if (pending?.length) {
+            setPermissionQueue(pending);
+            setPermissionRequest(pending[0]);
+          }
         } catch { /* ignore */ }
       }
       setIsInitialized(true);
@@ -289,11 +300,22 @@ export default function AgentConversationView({
         break;
       }
 
+      case 'skills': {
+        const skills = (event as any).skills as { name: string; description: string }[];
+        if (Array.isArray(skills)) setAvailableSkills(skills);
+        break;
+      }
+
       case 'status': {
         const s = (event as any).status as AgentStatus;
         setStatus(s);
         setStatusLabel((event as any).label || '');
         setStatusToolName((event as any).toolName || '');
+        // 回合结束（idle/completed/aborted）时清空权限队列，防止残留
+        if (s === 'idle' || s === 'completed' || s === 'aborted' || s === 'error') {
+          setPermissionQueue([]);
+          setPermissionRequest(null);
+        }
         break;
       }
 
@@ -436,7 +458,7 @@ export default function AgentConversationView({
 
       case 'permission_request': {
         const req = event as any;
-        setPermissionRequest({
+        const data: PermissionRequestData = {
           requestId: req.requestId,
           toolName: req.toolName,
           toolInput: req.toolInput,
@@ -444,6 +466,13 @@ export default function AgentConversationView({
           title: req.title,
           displayName: req.displayName,
           suggestions: req.suggestions,
+        };
+        // A4 修复：入队并展示队首（去重，避免重复事件叠加）
+        setPermissionQueue(prev => {
+          if (prev.some((r) => r.requestId === data.requestId)) return prev;
+          const next = [...prev, data];
+          setPermissionRequest(prev.length === 0 ? data : prev[0]);
+          return next;
         });
         break;
       }
@@ -451,6 +480,16 @@ export default function AgentConversationView({
       case 'result': {
         // Turn completed
         setBlocks(prev => prev.map(b => b.isStreaming ? { ...b, isStreaming: false } : b));
+        // 记录用量（/cost 与回合结束展示）
+        const res = event as any;
+        if (typeof res.costUsd === 'number') {
+          setUsageInfo({
+            costUsd: res.costUsd,
+            durationMs: res.durationMs || 0,
+            numTurns: res.numTurns || 1,
+          });
+          setShowUsage(true);
+        }
         break;
       }
 
@@ -480,7 +519,7 @@ export default function AgentConversationView({
   }, [onSessionIdChange, scrollToBottom]);
 
   // Send message
-  const handleSend = useCallback(async (text: string) => {
+  const handleSend = useCallback(async (text: string, attachments?: Attachment[]) => {
     setError(null);
 
     // Add user message to blocks
@@ -488,6 +527,7 @@ export default function AgentConversationView({
       id: 'user-' + Date.now(),
       type: 'user_text',
       content: text,
+      attachments: attachments || [],
     }]);
     scrollToBottom();
 
@@ -495,6 +535,7 @@ export default function AgentConversationView({
       await ipc.invoke(Channels.AGENT_SEND, {
         convId: conversationId,
         text,
+        attachments: attachments || [],
         model,
         permissionMode,
         thinkingEffort,
@@ -513,6 +554,15 @@ export default function AgentConversationView({
     }
   }, [conversationId]);
 
+  // A4 修复：从队列移除已响应的权限请求，并显示下一个（若有）
+  const popPermission = useCallback((requestId: string) => {
+    setPermissionQueue(prev => {
+      const next = prev.filter((r) => r.requestId !== requestId);
+      setPermissionRequest(next.length > 0 ? next[0] : null);
+      return next;
+    });
+  }, []);
+
   // Permission response
   const handleAllow = useCallback((requestId: string, allowAll?: boolean) => {
     // Use ref to get the latest permissionRequest — avoids stale closure when
@@ -530,8 +580,8 @@ export default function AgentConversationView({
     }).catch((err: unknown) => {
       console.error('[Agent] Permission allow IPC error:', err);
     });
-    setPermissionRequest(null);
-  }, [conversationId]);
+    popPermission(requestId);
+  }, [conversationId, popPermission]);
 
   const handleDeny = useCallback((requestId: string) => {
     ipc.invoke(Channels.AGENT_PERMISSION_RESPOND, {
@@ -546,8 +596,8 @@ export default function AgentConversationView({
     }).catch((err: unknown) => {
       console.error('[Agent] Permission deny IPC error:', err);
     });
-    setPermissionRequest(null);
-  }, [conversationId]);
+    popPermission(requestId);
+  }, [conversationId, popPermission]);
 
   // Branch conversation from a specific user message
   const handleBranch = useCallback(async (messageId: string) => {
@@ -679,6 +729,31 @@ export default function AgentConversationView({
       {/* Changed files panel - surfaces agent file edits inline */}
       <AgentChangedFiles files={changedFiles} onOpenDetails={onOpenActivity} />
 
+      {/* Usage / cost line — /cost 或回合结束后展示 */}
+      {showUsage && usageInfo && (
+        <div
+          className="flex items-center justify-center gap-3 px-4 py-1.5"
+          style={{ background: 'var(--bg-surface)', borderTop: '1px solid var(--border-subtle)' }}
+        >
+          <span className="text-[11px] font-medium tabular-nums" style={{ color: 'var(--fg-tertiary)' }}>
+            🪙 ${usageInfo.costUsd > 0 ? usageInfo.costUsd.toFixed(4) : '0.0000'}
+          </span>
+          <span className="text-[11px] tabular-nums" style={{ color: 'var(--fg-quaternary)' }}>
+            {usageInfo.numTurns} turn{usageInfo.numTurns > 1 ? 's' : ''}
+          </span>
+          <span className="text-[11px] tabular-nums" style={{ color: 'var(--fg-quaternary)' }}>
+            {(usageInfo.durationMs / 1000).toFixed(1)}s
+          </span>
+          <button
+            onClick={() => setShowUsage(false)}
+            className="text-[10px] px-1.5 py-0.5 rounded hover:bg-[var(--tint-hover)]"
+            style={{ color: 'var(--fg-quaternary)' }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* Input */}
       <AgentChatInput
         status={status}
@@ -694,6 +769,8 @@ export default function AgentConversationView({
         onModelChange={onModelChange}
         onPermissionModeChange={onPermissionModeChange}
         onThinkingEffortChange={onThinkingEffortChange}
+        onCostToggle={() => setShowUsage(prev => !prev)}
+        availableSkills={availableSkills}
       />
     </div>
   );

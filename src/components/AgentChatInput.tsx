@@ -1,11 +1,13 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
-  Send, Square, ArrowUp, HelpCircle, FileCode, Zap,
+  Send, Square, ArrowUp, HelpCircle, FileCode, Zap, Paperclip, ImagePlus,
 } from 'lucide-react';
 import ControlBar from './ControlBar';
-import type { ModelOption, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption } from '../types';
+import type { ModelOption, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption, Attachment } from '../types';
 import { buildSlashCommands } from '../lib/commands';
 import type { SlashCommand } from '../lib/commands';
+import { ipc } from '../lib/ipc';
+import { useAttachments, AttachmentPreview } from '../lib/attachments';
 
 /* ---------- slash commands ---------- */
 
@@ -15,7 +17,7 @@ const SLASH_COMMANDS = buildSlashCommands();
 
 interface AgentChatInputProps {
   status: string;
-  onSend: (text: string) => void;
+  onSend: (text: string, attachments: Attachment[]) => void;
   onAbort: () => void;
   disabled?: boolean;
   model?: string;
@@ -28,6 +30,10 @@ interface AgentChatInputProps {
   onPermissionModeChange?: (mode: PermissionMode) => void;
   onThinkingEffortChange?: (effort: ThinkingEffort) => void;
   onSlashCommand?: (cmd: string) => void;
+  /** /cost — 切换显示本会话用量 */
+  onCostToggle?: () => void;
+  /** 会话真实可用的 skills（SDK supportedCommands 推送），合并进命令面板 */
+  availableSkills?: { name: string; description: string }[];
 }
 
 /* ---------- component ---------- */
@@ -37,7 +43,7 @@ export default function AgentChatInput({
   model, permissionMode, thinkingEffort,
   models, permissionModes, thinkingEfforts,
   onModelChange, onPermissionModeChange, onThinkingEffortChange,
-  onSlashCommand,
+  onSlashCommand, onCostToggle, availableSkills,
 }: AgentChatInputProps) {
   const [text, setText] = useState('');
   const [focused, setFocused] = useState(false);
@@ -53,18 +59,36 @@ export default function AgentChatInput({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const dragRef = useRef<{ startY: number; startH: number } | null>(null);
 
+  /* ---- attachments ---- */
+  const {
+    attachments, dragOver, setDragOver,
+    removeAttachment, clearAttachments,
+    handleAddFiles, handleAddImages, handlePaste, handleDrop,
+  } = useAttachments();
+
   const isActive = status !== 'idle' && status !== 'completed' && status !== 'error' && status !== 'aborted';
-  const canSend = text.trim().length > 0 && !isActive && !disabled;
+  const canSend = (text.trim().length > 0 || attachments.length > 0) && !isActive && !disabled;
 
   /* ---- slash panel ---- */
   const isCmdMode = text.startsWith('/') && !text.includes(' ');
   const cmdQuery = text.slice(1).toLowerCase();
+  // 真实 skills（SDK supportedCommands）转成命令项，与内置命令合并
+  const skillCommands = useMemo<SlashCommand[]>(() =>
+    (availableSkills || []).map(s => ({
+      id: `skill:${s.name}`,
+      label: s.name,
+      description: s.description,
+      icon: FileCode,
+    })),
+  [availableSkills]);
+
   const filteredCmds = useMemo(() => {
     if (!isCmdMode) return [];
-    return SLASH_COMMANDS.filter(
+    const all = [...SLASH_COMMANDS, ...skillCommands];
+    return all.filter(
       c => c.id.startsWith(cmdQuery) || c.label.toLowerCase().includes(cmdQuery),
     );
-  }, [isCmdMode, cmdQuery]);
+  }, [isCmdMode, cmdQuery, skillCommands]);
 
   useEffect(() => { setCmdIndex(0); }, [cmdQuery]);
 
@@ -73,9 +97,7 @@ export default function AgentChatInput({
     if (!atSearchOpen) return;
     const timer = setTimeout(async () => {
       try {
-        const ipc = (window as any).ipc;
-        if (!ipc?.invoke) return;
-        const result: any = await ipc.invoke('file:search', { query: atSearchQuery });
+        const result = await ipc.invoke<{ ok: boolean; files?: Array<{path: string, name: string, isDirectory: boolean}> }>('file:search', { query: atSearchQuery });
         if (result?.ok) setAtSearchResults(result.files || []);
       } catch {
         setAtSearchResults([]);
@@ -122,11 +144,12 @@ export default function AgentChatInput({
   /* ---- send ---- */
   const handleSend = useCallback(() => {
     const trimmed = text.trim();
-    if (!trimmed || isActive || disabled) return;
-    onSend(trimmed);
+    if ((!trimmed && attachments.length === 0) || isActive || disabled) return;
+    onSend(trimmed, attachments);
     setText('');
+    clearAttachments();
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
-  }, [text, isActive, disabled, onSend]);
+  }, [text, attachments, isActive, disabled, onSend, clearAttachments]);
 
   /* ---- insert file reference ---- */
   const insertFileReference = useCallback((file: {path: string, name: string}) => {
@@ -252,9 +275,10 @@ export default function AgentChatInput({
       return;
     }
 
-    // Send
+    // Send — 注意：Cmd+Enter 在 macOS 上同时携带 metaKey/ctrlKey，
+    // 如果用两个独立 if 会触发两次 handleSend（A1 双重发送 bug）。
+    // 统一：非 Shift 的 Enter（含 Cmd+Enter / Ctrl+Enter）都是发送。
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); handleSend(); }
   };
 
   const executeCommand = (cmd: SlashCommand) => {
@@ -267,11 +291,31 @@ export default function AgentChatInput({
       textareaRef.current?.focus();
       return;
     }
-    if (cmd.id === 'new') { onSlashCommand?.('new'); setText(''); textareaRef.current?.focus(); return; }
-    if (cmd.id === 'clear') { onSlashCommand?.('clear'); setText(''); textareaRef.current?.focus(); return; }
+    if (cmd.id === 'new') {
+      // 派发事件让 App 层创建新会话（与 ⌘N 一致）
+      window.dispatchEvent(new CustomEvent('ccd:new-chat'));
+      setText(''); textareaRef.current?.focus(); return;
+    }
+    if (cmd.id === 'clear') {
+      // 派发事件让 App 层弹确认框清空当前会话
+      window.dispatchEvent(new CustomEvent('ccd:clear-conv'));
+      setText(''); textareaRef.current?.focus(); return;
+    }
     if (cmd.id === 'compact') { onSlashCommand?.('compact'); setText(''); textareaRef.current?.focus(); return; }
-    if (cmd.id === 'cost') { onSlashCommand?.('cost'); setText(''); textareaRef.current?.focus(); return; }
+    if (cmd.id === 'cost') {
+      // 切换显示用量（回合结束后 result 事件已带上真实 costUsd）
+      onCostToggle?.();
+      setText(''); textareaRef.current?.focus(); return;
+    }
     if (cmd.id === 'help') { setHelpOpen(prev => !prev); setText(''); textareaRef.current?.focus(); return; }
+    // 真实 skill 命令 → 直接发送 /<name> 给 agent（模型上下文里已加载该 skill）
+    if (cmd.id.startsWith('skill:')) {
+      const name = cmd.id.slice('skill:'.length);
+      setText('');
+      onSend(`/${name}`, []);
+      textareaRef.current?.focus();
+      return;
+    }
     if (onSlashCommand) onSlashCommand(cmd.id);
     setText(`/${cmd.id} `);
     textareaRef.current?.focus();
@@ -310,20 +354,23 @@ export default function AgentChatInput({
               <button onClick={() => setHelpOpen(false)} style={{ color: 'var(--fg-quaternary)', background: 'none', border: 'none', cursor: 'pointer', fontSize: 12 }}>✕</button>
             </div>
             <div className="py-1 max-h-[300px] overflow-y-auto">
-              {SLASH_COMMANDS.map((cmd) => {
+              {[...SLASH_COMMANDS, ...skillCommands].map((cmd) => {
                 const Icon = cmd.icon;
+                const isSkill = cmd.id.startsWith('skill:');
                 return (
                   <div key={cmd.id} className="flex items-center gap-3 px-3.5 py-2">
-                    <div className="flex-shrink-0 w-6 h-6 rounded flex items-center justify-center" style={{ background: 'var(--bg-surface-2)' }}>
-                      <Icon size={12} style={{ color: 'var(--fg-tertiary)' }} />
+                    <div className="flex-shrink-0 w-6 h-6 rounded flex items-center justify-center" style={{ background: isSkill ? 'rgba(124,91,245,0.12)' : 'var(--bg-surface-2)' }}>
+                      <Icon size={12} style={{ color: isSkill ? 'var(--accent-bright)' : 'var(--fg-tertiary)' }} />
                     </div>
                     <div className="flex-1 min-w-0">
-                      <span className="text-[12px] font-medium" style={{ color: 'var(--fg-primary)' }}>/{cmd.id}</span>
+                      <span className="text-[12px] font-medium" style={{ color: 'var(--fg-primary)' }}>
+                        /{cmd.id.startsWith('skill:') ? cmd.id.slice(6) : cmd.id}
+                      </span>
                       <span className="text-[11px] ml-2" style={{ color: 'var(--fg-quaternary)' }}>{cmd.description}</span>
                     </div>
-                    {cmd.shortcut && (
-                      <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{ color: 'var(--fg-quaternary)', background: 'var(--tint-subtle)' }}>
-                        {cmd.shortcut}
+                    {isSkill && (
+                      <span className="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded" style={{ color: 'var(--accent-bright)', background: 'rgba(124,91,245,0.12)', letterSpacing: '0.04em' }}>
+                        Skill
                       </span>
                     )}
                   </div>
@@ -397,6 +444,8 @@ export default function AgentChatInput({
               {filteredCmds.map((cmd, i) => {
                 const Icon = cmd.icon;
                 const active = i === cmdIndex;
+                const isSkill = cmd.id.startsWith('skill:');
+                const displayName = isSkill ? cmd.id.slice('skill:'.length) : cmd.id;
                 return (
                   <div
                     key={cmd.id}
@@ -416,13 +465,18 @@ export default function AgentChatInput({
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="text-[12.5px] font-medium" style={{ color: active ? 'var(--fg-primary)' : 'var(--fg-secondary)' }}>
-                        /{cmd.id}
+                        /{displayName}
                       </div>
                       <div className="text-[11px] truncate" style={{ color: 'var(--fg-quaternary)' }}>
                         {cmd.description}
                       </div>
                     </div>
-                    {cmd.shortcut && (
+                    {isSkill && (
+                      <span className="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded" style={{ color: 'var(--accent-bright)', background: 'rgba(124,91,245,0.12)', letterSpacing: '0.04em' }}>
+                        Skill
+                      </span>
+                    )}
+                    {!isSkill && cmd.shortcut && (
                       <span
                         className="text-[10px] font-medium px-1.5 py-0.5 rounded"
                         style={{ color: 'var(--fg-quaternary)', background: 'var(--tint-subtle)' }}
@@ -442,12 +496,17 @@ export default function AgentChatInput({
           className="rounded-2xl overflow-hidden transition-all"
           style={{
             background: 'var(--bg-surface)',
-            border: `1px solid ${focused ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-            boxShadow: focused
+            border: `1px solid ${
+              dragOver ? 'var(--accent-primary)' : focused ? 'var(--accent-primary)' : 'var(--border-default)'
+            }`,
+            boxShadow: dragOver || focused
               ? '0 0 0 3px rgba(124,91,245,0.10), var(--shadow-md)'
               : 'var(--shadow-sm)',
             transition: 'border-color 200ms ease, box-shadow 200ms ease',
           }}
+          onDrop={handleDrop}
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+          onDragLeave={() => setDragOver(false)}
         >
           {/* Drag handle */}
           <div
@@ -465,12 +524,38 @@ export default function AgentChatInput({
             <div style={{ width: 32, height: 3, borderRadius: 2, background: 'var(--fg-quaternary)' }} />
           </div>
 
+          {/* Drag-over hint */}
+          {dragOver && (
+            <div className="px-4 pt-1.5">
+              <div
+                className="flex items-center justify-center gap-2 py-2 rounded-lg text-[12px] font-medium"
+                style={{
+                  background: 'var(--accent-subtle)',
+                  border: '1.5px dashed var(--accent-primary)',
+                  color: 'var(--accent-bright)',
+                }}
+              >
+                <FileCode size={13} /> Drop files or images to attach
+              </div>
+            </div>
+          )}
+
+          {/* Attachment previews */}
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-4 pt-2">
+              {attachments.map((att) => (
+                <AttachmentPreview key={att.id} att={att} onRemove={removeAttachment} />
+              ))}
+            </div>
+          )}
+
           {/* Textarea */}
           <textarea
             ref={textareaRef}
             value={text}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
             placeholder={placeholder}
@@ -489,6 +574,25 @@ export default function AgentChatInput({
           {/* Bottom toolbar — matches ChatView layout */}
           <div className="flex items-center justify-between px-3.5 pb-3">
             <div className="flex items-center gap-2">
+              {/* Attach file / image buttons */}
+              <button
+                onClick={handleAddFiles}
+                disabled={isActive || disabled}
+                className="h-7 w-7 rounded-lg flex items-center justify-center transition-colors hover:bg-[var(--tint-hover)]"
+                style={{ color: 'var(--fg-tertiary)' }}
+                title="Attach file (@path)"
+              >
+                <Paperclip size={13} />
+              </button>
+              <button
+                onClick={handleAddImages}
+                disabled={isActive || disabled}
+                className="h-7 w-7 rounded-lg flex items-center justify-center transition-colors hover:bg-[var(--tint-hover)]"
+                style={{ color: 'var(--fg-tertiary)' }}
+                title="Attach image"
+              >
+                <ImagePlus size={13} />
+              </button>
               {/* Agent badge */}
               <div
                 className="flex items-center gap-1.5 px-2 py-1 rounded-md"

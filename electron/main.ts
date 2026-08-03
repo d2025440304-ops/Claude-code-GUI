@@ -39,6 +39,7 @@ import { PtyManager } from './integration/pty-manager';
 import { ClaudePtyManager, ClaudePtyPermission } from './integration/claude-pty-manager';
 import { SessionWatcherManager, SessionEvent } from './integration/session-watcher';
 import { AgentSdkBridge } from './integration/agent-sdk-bridge';
+import { scanSkills, SkillInfo } from './integration/skills-scanner';
 import type { PermissionDecision } from './types/agent';
 
 // ---------------------------------------------------------------------------
@@ -1318,6 +1319,8 @@ function registerIpcHandlers(): void {
         permissionMode: payload.permissionMode as any,
         thinkingEffort: payload.thinkingEffort as any,
         apiKey: settings.apiKey as string | undefined,
+        // skills 总开关：false → 传 []（禁用全部）；默认不传（全部加载）
+        ...(settings.skillsEnabled === false ? { skills: [] } : {}),
       });
       return { ok: true, sessionStatus: agentBridge.getStatus(payload.convId) };
     },
@@ -1328,6 +1331,7 @@ function registerIpcHandlers(): void {
     async (_e: IpcMainInvokeEvent, payload: {
       convId: string;
       text: string;
+      attachments?: Attachment[];
       model?: string;
       permissionMode?: string;
       thinkingEffort?: string;
@@ -1336,10 +1340,10 @@ function registerIpcHandlers(): void {
         // Flush any previous turn's partial data before starting a new turn,
         // so the accumulated assistant blocks are committed to DB cleanly.
         flushAgentMessages(payload.convId);
-        // Persist the user message to the database
+        // Persist the user message to the database (text + attachments)
         try {
-          messageRepo.create(payload.convId, 'user', payload.text);
-          conversationRepo.updateLastMessage(payload.convId, payload.text);
+          messageRepo.create(payload.convId, 'user', payload.text, payload.attachments || []);
+          conversationRepo.updateLastMessage(payload.convId, payload.text || payload.attachments?.[0]?.name || '');
         } catch (err) {
           console.error('[Main] Failed to persist agent user message:', err);
         }
@@ -1353,7 +1357,7 @@ function registerIpcHandlers(): void {
 
         // Fire-and-forget: sendMessage runs the whole turn asynchronously.
         // Errors are caught and emitted to the renderer so the user sees them.
-        agentBridge.sendMessage(payload.convId, payload.text).catch((err) => {
+        agentBridge.sendMessage(payload.convId, payload.text, payload.attachments || []).catch((err) => {
           console.error('[Main] Agent sendMessage failed:', err);
         });
         return { ok: true };
@@ -1404,7 +1408,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     Channels.AGENT_GET_PENDING_PERMISSION,
     (_e: IpcMainInvokeEvent, payload: { convId: string }): unknown => {
-      return agentBridge.getPendingPermission(payload.convId);
+      return agentBridge.getPendingPermissions(payload.convId);
     },
   );
 
@@ -1424,6 +1428,15 @@ function registerIpcHandlers(): void {
       settings[payload.key] = payload.value;
       saveSettings(settings);
       return { ok: true };
+    },
+  );
+
+  // -- Skills 扫描（设置面板）
+
+  ipcMain.handle(
+    Channels.SKILLS_LIST,
+    (_e: IpcMainInvokeEvent, payload: { projectPaths?: string[] }): { skills: SkillInfo[] } => {
+      return { skills: scanSkills(payload.projectPaths || []) };
     },
   );
 

@@ -99,6 +99,9 @@ export const Channels = {
   FILE_READ: 'file:read',
   FILE_SEARCH: 'file:search',
 
+  // Skills 扫描（设置面板）— invoke/handle
+  SKILLS_LIST: 'skills:list',
+
   // Git diff — invoke/handle
   GIT_DIFF: 'git:diff',
 

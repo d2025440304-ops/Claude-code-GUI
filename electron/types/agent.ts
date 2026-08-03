@@ -127,6 +127,12 @@ export interface AgentInitEvent extends AgentEventBase {
   sessionId: string;
 }
 
+/** 会话可用的真实 skills / slash 命令（来自 SDK supportedCommands()）。 */
+export interface AgentSkillsEvent extends AgentEventBase {
+  type: 'skills';
+  skills: { name: string; description: string }[];
+}
+
 export type AgentEvent =
   | AgentTextEvent
   | AgentTextDeltaEvent
@@ -139,7 +145,8 @@ export type AgentEvent =
   | AgentResultEvent
   | AgentErrorEvent
   | AgentFileChangedEvent
-  | AgentInitEvent;
+  | AgentInitEvent
+  | AgentSkillsEvent;
 
 // ---------------------------------------------------------------------------
 // Permission decision (renderer → main invoke)

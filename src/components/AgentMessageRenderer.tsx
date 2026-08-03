@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import type { Attachment } from '../types';
 import {
   ChevronRight, ChevronDown, Loader2, Check, AlertCircle, Wrench,
   FileText, Search, Terminal, Eye, FileCode,
@@ -14,6 +15,8 @@ export interface AgentMessageBlock {
   id: string;
   type: 'user_text' | 'text' | 'thinking' | 'tool_use' | 'tool_result';
   content?: string;
+  /** 用户消息附带的图片/文件（发送后即时显示） */
+  attachments?: Attachment[];
   toolName?: string;
   toolUseId?: string;
   toolInput?: Record<string, unknown>;
@@ -52,7 +55,7 @@ const TOOL_ICONS: Record<string, typeof Wrench> = {
 export function AgentMessageBlockRenderer({ block }: { block: AgentMessageBlock }) {
   switch (block.type) {
     case 'user_text':
-      return <UserTextBlock text={block.content || ''} />;
+      return <UserTextBlock text={block.content || ''} attachments={block.attachments} />;
     case 'text':
       return <TextBlock text={block.content || ''} isStreaming={block.isStreaming} />;
     case 'thinking':
@@ -70,7 +73,7 @@ export function AgentMessageBlockRenderer({ block }: { block: AgentMessageBlock 
 // User message bubble
 // ---------------------------------------------------------------------------
 
-function UserTextBlock({ text }: { text: string }) {
+function UserTextBlock({ text, attachments }: { text: string; attachments?: Attachment[] }) {
   return (
     <div
       style={{
@@ -94,10 +97,36 @@ function UserTextBlock({ text }: { text: string }) {
           wordBreak: 'break-word',
         }}
       >
+        {attachments && attachments.length > 0 && (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: text ? 10 : 0, justifyContent: 'flex-end' }}>
+            {attachments.map((att) => {
+              if (att.kind === 'image' && att.dataUrl) {
+                return (
+                  <img
+                    key={att.id}
+                    src={att.dataUrl}
+                    alt={att.name}
+                    style={{ width: 96, height: 96, objectFit: 'cover', borderRadius: 10, border: '1px solid rgba(124,91,245,0.2)' }}
+                  />
+                );
+              }
+              return (
+                <span
+                  key={att.id}
+                  className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[11px]"
+                  style={{ background: 'rgba(124,91,245,0.12)', border: '1px solid rgba(124,91,245,0.2)', color: 'var(--fg-secondary)' }}
+                >
+                  <FileCode size={11} />
+                  {att.name}
+                </span>
+              );
+            })}
+          </div>
+        )}
         {text}
       </div>
     </div>
-  );
+  )
 }
 
 // ---------------------------------------------------------------------------
