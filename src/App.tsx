@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Plus, Search, Pin, FolderOpen, Settings, ChevronDown, Sparkles, Edit3, Loader2, Trash2, X, MessageSquare, Hash, Sun, Moon, PanelLeft, ExternalLink, History, Terminal, Globe, PanelRight, MessageCircle, Key, Eye, EyeOff, Check, Shield } from 'lucide-react'
+import { Plus, Search, Pin, FolderOpen, Settings, ChevronDown, Sparkles, Edit3, Loader2, Trash2, X, MessageSquare, Hash, Sun, Moon, PanelLeft, ExternalLink, History, Terminal, Globe, PanelRight, MessageCircle, Key, Eye, EyeOff, Check, Shield, FileCode } from 'lucide-react'
 import ChatView from './components/ChatView'
 import AgentConversationView from './components/AgentConversationView'
 import ImportedChatView from './components/ImportedChatView'
@@ -8,12 +8,13 @@ import ConversationItem from './components/ConversationItem'
 import ModelSelector from './components/ModelSelector'
 import ProjectSelector from './components/ProjectSelector'
 import ConfirmDialog from './components/ConfirmDialog'
-import { ipc } from './lib/ipc'
+import { ipc, Channels } from './lib/ipc'
 import type { StreamChunk, StreamChunkPayload, StreamEndPayload, StreamErrorPayload } from './lib/ipc'
 import type { StreamState, StreamMachineEvent } from './lib/streamMachine'
 import { reduce as reduceStreamState, isStreamActive } from './lib/streamMachine'
 import type { Conversation, Message, Attachment, HistoryConversation, HistoryConversationDetail, PermissionMode, ThinkingEffort, ModelOption, ContentBlock } from './types'
 import { MODELS, PERMISSION_MODES, THINKING_EFFORTS } from './types'
+import { SkeletonConversationList } from './components/Skeleton'
 
 /* ---------- helpers ---------- */
 
@@ -258,6 +259,8 @@ export default function App() {
     title: string; message: string; confirmLabel?: string; danger?: boolean;
     onConfirm: () => void
   } | null>(null)
+  // 设置面板 Tab
+  const [settingsTab, setSettingsTab] = useState<'General' | 'API' | 'Shortcuts' | 'About'>('General')
 
   // Claude Code 历史对话
   const [historyConvs, setHistoryConvs] = useState<HistoryConversation[]>([])
@@ -1017,11 +1020,8 @@ export default function App() {
         {/* Conversation list */}
         <div className="flex-1 overflow-y-auto px-2.5">
           {loadingConvs ? (
-            <div className="flex flex-col items-center justify-center py-10 gap-2">
-              <Loader2 size={18} className="animate-spin text-[var(--fg-quaternary)]" />
-              <span className="text-[11px] text-[var(--fg-quaternary)]">Loading…</span>
-            </div>
-          ) : searchResults ? (
+                      <SkeletonConversationList count={6} />
+                    ) : searchResults ? (
             <>
               {pinned.length > 0 && (
                 <div className="mb-2">
@@ -1042,8 +1042,12 @@ export default function App() {
                 </div>
               )}
               {searchResults.length === 0 && (
-                <div className="flex flex-col items-center justify-center py-10 gap-2">
-                  <span className="text-[12px] text-[var(--fg-tertiary)]">No matches</span>
+                <div className="flex flex-col items-center justify-center py-12 gap-3">
+                  <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: 'var(--bg-surface-2)' }}>
+                    <Search size={16} className="text-[var(--fg-quaternary)]" />
+                  </div>
+                  <span className="text-[12px] font-medium" style={{ color: 'var(--fg-tertiary)' }}>No matches</span>
+                  <span className="text-[11px]" style={{ color: 'var(--fg-quaternary)' }}>Try a different search term</span>
                 </div>
               )}
             </>
@@ -1087,15 +1091,12 @@ export default function App() {
                 )
               })}
               {conversations.length === 0 && (
-                <div className="flex flex-col items-center justify-center py-10 gap-2">
-                  <div
-                    className="w-10 h-10 rounded-xl flex items-center justify-center mb-1"
-                    style={{ background: 'var(--bg-surface-2)' }}
-                  >
-                    <MessageSquare size={16} className="text-[var(--fg-quaternary)]" />
+                <div className="flex flex-col items-center justify-center py-14 gap-3">
+                  <div className="w-12 h-12 rounded-2xl flex items-center justify-center" style={{ background: 'linear-gradient(135deg, var(--accent-subtle) 0%, var(--bg-surface-2) 100%)' }}>
+                    <MessageSquare size={18} className="text-[var(--fg-quaternary)]" />
                   </div>
-                  <span className="text-[12px] font-medium text-[var(--fg-tertiary)]">No conversations yet</span>
-                  <span className="text-[11px] text-[var(--fg-quaternary)]">Start a new chat to begin</span>
+                  <span className="text-[13px] font-medium" style={{ color: 'var(--fg-tertiary)' }}>No conversations yet</span>
+                  <span className="text-[11px]" style={{ color: 'var(--fg-quaternary)' }}>Press <kbd>⌘N</kbd> to start a new chat</span>
                 </div>
               )}
 
@@ -1468,142 +1469,223 @@ export default function App() {
       )}
 
       {/* Settings modal */}
-      {showSettings && (
-        <>
-          <div
-            className="fixed inset-0 z-50"
-            style={{ background: 'rgba(0,0,0,0.45)' }}
-            onClick={() => setShowSettings(false)}
-          />
-          <div
-            className="fixed z-50 rounded-2xl animate-scale-in"
-            style={{
-              top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
-              width: '400px', maxWidth: '90vw',
-              background: 'var(--bg-surface)',
-              border: '1px solid var(--border-default)',
-              boxShadow: 'var(--shadow-lg)',
-            }}
-          >
-            <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
-              <span className="text-[14px] font-semibold text-[var(--fg-primary)]">Settings</span>
-              <button
-                onClick={() => setShowSettings(false)}
-                className="p-1 rounded-md hover:bg-[var(--tint-hover)] transition-colors"
-              >
-                <X size={14} className="text-[var(--fg-tertiary)]" />
-              </button>
-            </div>
-            <div className="px-5 py-4 flex flex-col gap-5">
-              <div>
-                <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>Claude CLI</div>
-                <div className="flex items-center gap-2 text-[12px]">
-                  <div className={`dot ${cliInfo?.installed ? 'dot-connected' : cliInfo ? 'dot-error' : 'dot-disconnected'}`} />
-                  <span style={{ color: 'var(--fg-secondary)' }}>
-                    {cliInfo === null ? 'Checking…' : cliInfo.installed ? `Installed v${cliInfo.version}` : 'Not installed'}
-                  </span>
-                </div>
-                {cliInfo?.error && (
-                  <div className="text-[11px] mt-1.5" style={{ color: 'var(--danger)' }}>{cliInfo.error}</div>
-                )}
-              </div>
-              <div>
-                <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>API Key</div>
-                <div className="text-[11px] mb-2" style={{ color: 'var(--fg-tertiary)' }}>
-                  Required for Agent SDK mode. Your key is stored locally and never sent to third parties.
-                </div>
-                <div className="flex items-center gap-2">
-                  <div className="flex-1 relative">
-                    <input
-                      type={apiKeyVisible ? 'text' : 'password'}
-                      value={apiKey}
-                      onChange={(e) => { setApiKey(e.target.value); setApiKeySaved(false) }}
-                      placeholder="sk-ant-api03-..."
-                      className="w-full px-3 py-2 rounded-lg text-[12px] font-mono outline-none transition-all"
-                      style={{
-                        background: 'var(--bg-input)',
-                        border: '1px solid var(--border-default)',
-                        color: 'var(--fg-primary)',
-                      }}
-                      onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent-primary)'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(124,91,245,0.08)' }}
-                      onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border-default)'; e.currentTarget.style.boxShadow = 'none' }}
-                    />
-                    <button
-                      onClick={() => setApiKeyVisible(v => !v)}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded transition-colors hover:bg-[var(--tint-hover)]"
-                      title={apiKeyVisible ? 'Hide' : 'Show'}
-                    >
-                      {apiKeyVisible ? <EyeOff size={12} style={{ color: 'var(--fg-quaternary)' }} /> : <Eye size={12} style={{ color: 'var(--fg-quaternary)' }} />}
+      {showSettings && (() => {
+              const settingsTabs = ['General', 'API', 'Shortcuts', 'About'] as const
+              return (
+              <>
+                <div
+                  className="fixed inset-0 z-50"
+                  style={{ background: 'rgba(0,0,0,0.5)' }}
+                  onClick={() => setShowSettings(false)}
+                />
+                <div
+                  className="fixed z-50 rounded-2xl overflow-hidden animate-scale-in flex flex-col"
+                  style={{
+                    top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+                    width: '480px', maxWidth: '90vw', maxHeight: '80vh',
+                    background: 'var(--bg-glass)',
+                    backdropFilter: 'blur(24px) saturate(1.4)',
+                    WebkitBackdropFilter: 'blur(24px) saturate(1.4)',
+                    border: '1px solid var(--border-default)',
+                    boxShadow: 'var(--shadow-xl)',
+                  }}
+                >
+                  {/* Header */}
+                  <div className="flex items-center justify-between px-5 py-3.5 flex-shrink-0" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+                    <span className="text-[14px] font-semibold" style={{ color: 'var(--fg-primary)' }}>Settings</span>
+                    <button onClick={() => setShowSettings(false)} className="p-1 rounded-md hover:bg-[var(--tint-hover)] transition-colors">
+                      <X size={14} className="text-[var(--fg-tertiary)]" />
                     </button>
                   </div>
-                  <button
-                    onClick={() => {
-                      ipc.invoke('settings:set', { key: 'apiKey', value: apiKey })
-                        .then(() => { setApiKeySaved(true); setTimeout(() => setApiKeySaved(false), 2000) })
-                        .catch(() => {})
-                    }}
-                    className="px-3 py-2 rounded-lg text-[11px] font-medium transition-all flex items-center gap-1.5"
-                    style={{
-                      background: apiKeySaved ? 'rgba(48,209,88,0.12)' : 'var(--accent-subtle)',
-                      color: apiKeySaved ? 'var(--success)' : 'var(--accent-bright)',
-                      border: `1px solid ${apiKeySaved ? 'rgba(48,209,88,0.2)' : 'rgba(124,91,245,0.15)'}`,
-                    }}
-                  >
-                    {apiKeySaved ? <><Check size={12} /> Saved</> : 'Save'}
-                  </button>
+
+                  {/* Tabs */}
+                  <div className="flex gap-1 px-5 pt-3 flex-shrink-0">
+                    {settingsTabs.map(tab => (
+                      <button
+                        key={tab}
+                        onClick={() => setSettingsTab(tab)}
+                        className="px-3 py-1.5 rounded-lg text-[11px] font-medium transition-colors"
+                        style={{
+                          background: settingsTab === tab ? 'var(--accent-subtle)' : 'transparent',
+                          color: settingsTab === tab ? 'var(--accent-bright)' : 'var(--fg-tertiary)',
+                        }}
+                      >
+                        {tab}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Content */}
+                  <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-5 min-h-0">
+                    {/* ── General ── */}
+                    {settingsTab === 'General' && (
+                      <>
+                        <div>
+                          <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>Theme</div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => setTheme('dark')}
+                              className="flex-1 px-3 py-2.5 rounded-lg text-[12px] font-medium transition-all flex items-center justify-center gap-1.5"
+                              style={{
+                                background: theme === 'dark' ? 'var(--accent-subtle)' : 'var(--bg-surface-2)',
+                                color: theme === 'dark' ? 'var(--accent-bright)' : 'var(--fg-secondary)',
+                                border: theme === 'dark' ? '1px solid var(--border-accent)' : '1px solid var(--border-default)',
+                              }}
+                            >
+                              <Moon size={13} />Dark
+                            </button>
+                            <button
+                              onClick={() => setTheme('light')}
+                              className="flex-1 px-3 py-2.5 rounded-lg text-[12px] font-medium transition-all flex items-center justify-center gap-1.5"
+                              style={{
+                                background: theme === 'light' ? 'var(--accent-subtle)' : 'var(--bg-surface-2)',
+                                color: theme === 'light' ? 'var(--accent-bright)' : 'var(--fg-secondary)',
+                                border: theme === 'light' ? '1px solid var(--border-accent)' : '1px solid var(--border-default)',
+                              }}
+                            >
+                              <Sun size={13} />Light
+                            </button>
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>Claude CLI</div>
+                          <div className="flex items-center gap-2.5 text-[12px]">
+                            <div className={`dot ${cliInfo?.installed ? 'dot-connected' : cliInfo ? 'dot-error' : 'dot-disconnected'}`} />
+                            <span style={{ color: 'var(--fg-secondary)' }}>
+                              {cliInfo === null ? 'Checking…' : cliInfo.installed ? `Installed v${cliInfo.version}` : 'Not installed'}
+                            </span>
+                          </div>
+                          {cliInfo?.error && (
+                            <div className="text-[11px] mt-1.5" style={{ color: 'var(--danger)' }}>{cliInfo.error}</div>
+                          )}
+                        </div>
+                      </>
+                    )}
+
+                    {/* ── API ── */}
+                    {settingsTab === 'API' && (
+                      <div>
+                        <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>API Key</div>
+                        <div className="text-[11px] mb-3 leading-relaxed" style={{ color: 'var(--fg-tertiary)' }}>
+                          Required for Agent SDK mode. Your key is stored locally and never sent to third parties.
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 relative">
+                            <input
+                              type={apiKeyVisible ? 'text' : 'password'}
+                              value={apiKey}
+                              onChange={(e) => { setApiKey(e.target.value); setApiKeySaved(false) }}
+                              placeholder="sk-…"
+                              className="w-full px-3 py-2 rounded-lg text-[12px] font-mono outline-none transition-all input"
+                              onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent-primary)'; e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-subtle)' }}
+                              onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border-default)'; e.currentTarget.style.boxShadow = 'none' }}
+                            />
+                            <button
+                              onClick={() => setApiKeyVisible(v => !v)}
+                              className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded transition-colors hover:bg-[var(--tint-hover)]"
+                              title={apiKeyVisible ? 'Hide' : 'Show'}
+                            >
+                              {apiKeyVisible ? <EyeOff size={12} style={{ color: 'var(--fg-quaternary)' }} /> : <Eye size={12} style={{ color: 'var(--fg-quaternary)' }} />}
+                            </button>
+                          </div>
+                          <button
+                            onClick={() => {
+                              ipc.invoke('settings:set', { key: 'apiKey', value: apiKey })
+                                .then(() => { setApiKeySaved(true); setTimeout(() => setApiKeySaved(false), 2000) })
+                                .catch(() => {})
+                            }}
+                            className="px-3 py-2 rounded-lg text-[11px] font-medium transition-all flex items-center gap-1.5"
+                            style={{
+                              background: apiKeySaved ? 'var(--success-subtle)' : 'var(--accent-subtle)',
+                              color: apiKeySaved ? 'var(--success)' : 'var(--accent-bright)',
+                              border: `1px solid ${apiKeySaved ? 'rgba(48,209,88,0.2)' : 'var(--border-accent)'}`,
+                            }}
+                          >
+                            {apiKeySaved ? <><Check size={12} /> Saved</> : 'Save'}
+                          </button>
+                        </div>
+                        <a
+                          href="https://console.anthropic.com/settings/keys"
+                          target="_blank" rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 mt-2.5 text-[11px] transition-colors"
+                          style={{ color: 'var(--accent-bright)' }}
+                        >
+                          <Key size={10} />
+                          Get an API key from Anthropic Console
+                          <ExternalLink size={10} />
+                        </a>
+                      </div>
+                    )}
+
+                    {/* ── Shortcuts ── */}
+                    {settingsTab === 'Shortcuts' && (
+                      <div>
+                        <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-3" style={{ letterSpacing: '0.06em' }}>Keyboard Shortcuts</div>
+                        <div className="flex flex-col gap-1">
+                          {[
+                            { keys: '⌘N', label: 'New Chat' },
+                            { keys: '⌘M', label: 'Switch Model' },
+                            { keys: '⌘K', label: 'Search conversations' },
+                            { keys: '⌘B', label: 'Toggle sidebar' },
+                            { keys: '⌘J', label: 'Toggle right panel' },
+                            { keys: '⌘⇧C', label: 'Clear current chat' },
+                            { keys: 'Esc', label: 'Stop generation' },
+                            { keys: '⌘/ or /', label: 'Open slash commands' },
+                            { keys: '⌘Enter', label: 'Send message' },
+                          ].map((shortcut, i) => (
+                            <div key={i} className="flex items-center justify-between px-3 py-2 rounded-lg" style={{ background: 'var(--tint-subtle)' }}>
+                              <span className="text-[12px]" style={{ color: 'var(--fg-secondary)' }}>{shortcut.label}</span>
+                              <kbd>{shortcut.keys}</kbd>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ── About ── */}
+                    {settingsTab === 'About' && (
+                      <div className="flex flex-col items-center text-center py-4 gap-3">
+                        <div className="logo-mark" style={{ width: 40, height: 40, borderRadius: 12 }}>
+                          <Sparkles size={18} style={{ color: '#fff' }} />
+                        </div>
+                        <div>
+                          <div className="text-[14px] font-semibold" style={{ color: 'var(--fg-primary)' }}>Claude Code Desktop</div>
+                          <div className="text-[11px] mt-0.5" style={{ color: 'var(--fg-tertiary)' }}>v0.1.0</div>
+                        </div>
+                        <div className="text-[11px] leading-relaxed" style={{ color: 'var(--fg-quaternary)', maxWidth: 280 }}>
+                          A lightweight desktop GUI for Claude Code CLI. Built with Electron, React, and TypeScript.
+                        </div>
+                        <div className="flex gap-2 mt-1">
+                          <div className="tag">
+                            <FileCode size={10} />
+                            Electron
+                          </div>
+                          <div className="tag">
+                            <FileCode size={10} />
+                            React
+                          </div>
+                          <div className="tag">
+                            <FileCode size={10} />
+                            TypeScript
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Footer */}
+                  <div className="flex items-center justify-end px-5 py-3 flex-shrink-0" style={{ borderTop: '1px solid var(--border-subtle)' }}>
+                    <button
+                      onClick={() => setShowSettings(false)}
+                      className="btn btn-secondary text-[11px] px-4 py-1.5"
+                    >
+                      Close
+                    </button>
+                  </div>
                 </div>
-                <a
-                  href="https://console.anthropic.com/settings/keys"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 mt-2 text-[11px] transition-colors"
-                  style={{ color: 'var(--accent-bright)' }}
-                >
-                  <Key size={10} />
-                  Get an API key from Anthropic Console
-                  <ExternalLink size={10} />
-                </a>
-              </div>
-              <div>
-                <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>Theme</div>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setTheme('dark')}
-                    className="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5"
-                    style={{
-                      background: theme === 'dark' ? 'var(--accent-subtle)' : 'var(--bg-surface-2)',
-                      color: theme === 'dark' ? 'var(--accent-bright)' : 'var(--fg-secondary)',
-                      border: theme === 'dark' ? '1px solid var(--accent-primary)' : '1px solid var(--border-default)',
-                    }}
-                  >
-                    <Moon size={13} />Dark
-                  </button>
-                  <button
-                    onClick={() => setTheme('light')}
-                    className="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5"
-                    style={{
-                      background: theme === 'light' ? 'var(--accent-subtle)' : 'var(--bg-surface-2)',
-                      color: theme === 'light' ? 'var(--accent-bright)' : 'var(--fg-secondary)',
-                      border: theme === 'light' ? '1px solid var(--accent-primary)' : '1px solid var(--border-default)',
-                    }}
-                  >
-                    <Sun size={13} />Light
-                  </button>
-                </div>
-              </div>
-              <div>
-                <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>About</div>
-                <div className="text-[12px]" style={{ color: 'var(--fg-secondary)' }}>
-                  Claude Code Desktop v0.1.0
-                </div>
-                <div className="text-[11px] mt-1" style={{ color: 'var(--fg-quaternary)' }}>
-                  A lightweight GUI for Claude Code CLI
-                </div>
-              </div>
-            </div>
-          </div>
-        </>
-      )}
+              </>
+              )
+            })()}
 
       {/* Confirm dialog */}
       {confirmDialog && (

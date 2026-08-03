@@ -1,15 +1,17 @@
 /**
  * 右侧面板容器组件。
  *
- * 四个 Tab (Activity / Files / Terminal / Review) 用 CSS display 控制显隐。
+ * 四个 Tab (Activity / Files / Terminal / Review)。
  * 支持拖拽左边缘调整面板宽度。
+ * 无数据时显示空状态。
  */
 import { useState, useRef, useEffect } from 'react'
-import { FileText, GitCompare, X, Activity, Terminal } from 'lucide-react'
+import { FileText, GitCompare, X, Activity, Terminal, FolderOpen, Code, Monitor } from 'lucide-react'
 import FileExplorer from './FileExplorer'
 import CodeReview from './CodeReview'
 import ActivityPanel from './ActivityPanel'
 import TerminalView from './TerminalView'
+import { EmptyState } from './Skeleton'
 
 export type RightPanelTab = 'activity' | 'files' | 'terminal' | 'review'
 
@@ -67,6 +69,8 @@ export default function RightPanel({ projectPath, onClose, convId, sessionId }: 
     document.body.style.userSelect = 'none'
   }
 
+  const hasProject = !!projectPath
+
   return (
     <aside
       className="glass flex flex-col flex-shrink-0 relative"
@@ -118,19 +122,50 @@ export default function RightPanel({ projectPath, onClose, convId, sessionId }: 
         </button>
       </div>
 
-      {/* 面板内容 — 用 CSS display 控制显隐，避免卸载重建 */}
+      {/* 面板内容 */}
       <div className="flex-1 min-h-0 overflow-hidden relative">
+        {/* Activity */}
         <div style={{ display: activeTab === 'activity' ? 'block' : 'none', height: '100%' }}>
           <ActivityPanel convId={convId ?? null} sessionId={sessionId ?? null} cwd={projectPath} />
         </div>
+
+        {/* Files */}
         <div style={{ display: activeTab === 'files' ? 'block' : 'none', height: '100%' }}>
-          <FileExplorer projectPath={projectPath} />
+          {hasProject ? (
+            <FileExplorer projectPath={projectPath} />
+          ) : (
+            <EmptyState
+              icon={FolderOpen}
+              title="No project selected"
+              description="Select a conversation with a project path to browse files."
+            />
+          )}
         </div>
+
+        {/* Terminal */}
         <div style={{ display: activeTab === 'terminal' ? 'block' : 'none', height: '100%' }}>
-          <TerminalView projectPath={projectPath} />
+          {hasProject ? (
+            <TerminalView projectPath={projectPath} />
+          ) : (
+            <EmptyState
+              icon={Monitor}
+              title="No project selected"
+              description="Select a conversation with a project path to open a terminal."
+            />
+          )}
         </div>
+
+        {/* Review */}
         <div style={{ display: activeTab === 'review' ? 'block' : 'none', height: '100%' }}>
-          <CodeReview projectPath={projectPath} />
+          {hasProject ? (
+            <CodeReview projectPath={projectPath} />
+          ) : (
+            <EmptyState
+              icon={Code}
+              title="No project selected"
+              description="Select a conversation with a project path to review code changes."
+            />
+          )}
         </div>
       </div>
     </aside>

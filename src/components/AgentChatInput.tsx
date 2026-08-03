@@ -1,50 +1,15 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
-  Send, Square, ArrowUp, FileCode, Zap, Trash2, Plus, HelpCircle, Cpu,
-  Settings, Shield, Terminal,
+  Send, Square, ArrowUp, HelpCircle, FileCode, Zap,
 } from 'lucide-react';
 import ControlBar from './ControlBar';
 import type { ModelOption, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption } from '../types';
+import { buildSlashCommands } from '../lib/commands';
+import type { SlashCommand } from '../lib/commands';
 
 /* ---------- slash commands ---------- */
 
-interface SlashCmd {
-  id: string;
-  label: string;
-  desc: string;
-  icon: typeof Zap;
-  shortcut?: string;
-}
-
-const SLASH_COMMANDS: SlashCmd[] = [
-  { id: 'model', label: 'Switch Model', desc: 'Switch the AI model', icon: Cpu, shortcut: '⌘M' },
-  { id: 'new', label: 'New Chat', desc: 'Start a new conversation', icon: Plus, shortcut: '⌘N' },
-  { id: 'clear', label: 'Clear History', desc: 'Remove all messages', icon: Trash2 },
-  { id: 'compact', label: 'Compact Context', desc: 'Compress conversation to save tokens', icon: Zap },
-  { id: 'cost', label: 'Token Usage', desc: 'Show token usage and cost', icon: Zap },
-  { id: 'fast', label: 'Fast Mode', desc: 'Toggle fast mode', icon: Zap },
-  { id: 'continue', label: 'Continue', desc: 'Continue the most recent conversation', icon: ArrowUp },
-  { id: 'help', label: 'Help', desc: 'Show available commands', icon: HelpCircle },
-  { id: 'config', label: 'Configuration', desc: 'View or modify settings', icon: Settings },
-  { id: 'login', label: 'Login', desc: 'Sign in to Anthropic', icon: HelpCircle },
-  { id: 'logout', label: 'Logout', desc: 'Sign out', icon: HelpCircle },
-  { id: 'doctor', label: 'Diagnostics', desc: 'Diagnose config issues', icon: HelpCircle },
-  { id: 'permissions', label: 'Permissions', desc: 'Manage tool permissions', icon: Shield },
-  { id: 'init', label: 'Init Project', desc: 'Initialize CLAUDE.md', icon: FileCode },
-  { id: 'review', label: 'Review PR', desc: 'Review current pull request', icon: FileCode },
-  { id: 'pr-comments', label: 'PR Comments', desc: 'View PR comments', icon: FileCode },
-  { id: 'memory', label: 'Edit Memory', desc: 'Edit CLAUDE.md files', icon: FileCode },
-  { id: 'terminal-setup', label: 'Terminal Setup', desc: 'Configure terminal', icon: Terminal },
-  { id: 'vim', label: 'Vim Mode', desc: 'Toggle vim keybindings', icon: HelpCircle },
-  { id: 'mcp', label: 'MCP Servers', desc: 'Manage MCP connections', icon: HelpCircle },
-  { id: 'deep-research', label: 'Deep Research', desc: 'Multi-source research', icon: Zap },
-  { id: 'code-review', label: 'Code Review', desc: 'Review code changes', icon: FileCode },
-  { id: 'simplify', label: 'Simplify & Fix', desc: 'Auto-fix code issues', icon: Zap },
-  { id: 'verify', label: 'Verify', desc: 'Verify code changes', icon: Zap },
-  { id: 'security-review', label: 'Security Review', desc: 'Security review changes', icon: Shield },
-  { id: 'update-config', label: 'Update Config', desc: 'Configure settings.json', icon: Settings },
-  { id: 'loop', label: 'Loop', desc: 'Run command on interval', icon: Zap },
-];
+const SLASH_COMMANDS = buildSlashCommands();
 
 /* ---------- props ---------- */
 
@@ -292,7 +257,7 @@ export default function AgentChatInput({
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); handleSend(); }
   };
 
-  const executeCommand = (cmd: SlashCmd) => {
+  const executeCommand = (cmd: SlashCommand) => {
     // /model: toggle through available models
     if (cmd.id === 'model' && onModelChange && models) {
       const currentIndex = models.findIndex(m => m.id === (model || 'default'));
@@ -354,7 +319,7 @@ export default function AgentChatInput({
                     </div>
                     <div className="flex-1 min-w-0">
                       <span className="text-[12px] font-medium" style={{ color: 'var(--fg-primary)' }}>/{cmd.id}</span>
-                      <span className="text-[11px] ml-2" style={{ color: 'var(--fg-quaternary)' }}>{cmd.desc}</span>
+                      <span className="text-[11px] ml-2" style={{ color: 'var(--fg-quaternary)' }}>{cmd.description}</span>
                     </div>
                     {cmd.shortcut && (
                       <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{ color: 'var(--fg-quaternary)', background: 'var(--tint-subtle)' }}>
@@ -454,7 +419,7 @@ export default function AgentChatInput({
                         /{cmd.id}
                       </div>
                       <div className="text-[11px] truncate" style={{ color: 'var(--fg-quaternary)' }}>
-                        {cmd.desc}
+                        {cmd.description}
                       </div>
                     </div>
                     {cmd.shortcut && (
