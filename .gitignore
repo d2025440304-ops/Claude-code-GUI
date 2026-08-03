@@ -29,20 +29,6 @@ Thumbs.db
 # misc
 *.tsbuildinfo
 coverage/
-# dependencies
-node_modules/
 
-# build output
-dist/
-dist-electron/
-
-# logs
-*.log
-npm-debug.log*
-
-# os
-.DS_Store
-
-# editor
-.vscode/
-.idea/
+# nested git repos (e.g. stale checkouts inside the project)
+claude-code-desktop/
