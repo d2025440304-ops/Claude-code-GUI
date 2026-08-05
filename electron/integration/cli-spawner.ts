@@ -3,6 +3,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { StringDecoder } from 'string_decoder';
 import { StreamParser, ParsedChunk } from './stream-parser';
 import { resolveCwd } from './resolve-cwd';
+import { mapPermissionModeForCli } from '../ipc/permission-modes';
 
 export interface SendMessageOpts {
   cwd: string;
@@ -149,18 +150,11 @@ export class CliSpawner extends EventEmitter {
       args.push('--add-dir', ...opts.addDirs);
     }
 
-    // 权限模式映射到 CLI 参数
+    // 权限模式映射到 CLI 参数（使用共享映射）
     // 真实取值：acceptEdits | auto | bypassPermissions | default | dontAsk | plan
-    if (opts.permissionMode && opts.permissionMode !== 'ask') {
-      const modeMap: Record<string, string> = {
-        'auto-edit': 'acceptEdits',
-        'plan': 'plan',
-        'skip': 'bypassPermissions',
-      };
-      const cliMode = modeMap[opts.permissionMode];
-      if (cliMode) {
-        args.push('--permission-mode', cliMode);
-      }
+    const cliMode = mapPermissionModeForCli(opts.permissionMode);
+    if (cliMode) {
+      args.push('--permission-mode', cliMode);
     }
 
     // 思考等级映射到 CLI 参数
@@ -197,6 +191,14 @@ export class CliSpawner extends EventEmitter {
       }
       const payload =
         JSON.stringify({ type: 'user', message: { role: 'user', content: contentBlocks } }) + '\n';
+
+      // C5 修复：先注册 stdin 的 error 监听器，再写入。
+      // Node.js 中 stdin 是 Writable stream，子进程提前退出时写入会触发
+      // 异步 'error' 事件（EPIPE）。若无 error 监听器，该事件成为未捕获
+      // 异常直接崩掉主进程，导致正在进行的对话数据丢失。
+      child.stdin?.on('error', (stdinErr: Error) => {
+        console.warn(`[CliSpawner:${sessionId}] stdin error (child exited early):`, stdinErr.message);
+      });
       try {
         child.stdin?.end(payload, 'utf8');
       } catch (err) {

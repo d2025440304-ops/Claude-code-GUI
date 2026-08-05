@@ -311,12 +311,15 @@ export default function App() {
   const streamStateRef = useRef(streamState)
   streamStateRef.current = streamState
   const streamAbortRef = useRef<AbortController | null>(null)
+  /** C4: STOP_REQUESTED 超时守卫 ref，防止 INTERRUPTING 永久锁死输入框 */
+  const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Gracefully halt the active stream (New Chat / Stop / context switch).
   const abortActiveStream = useCallback(() => {
     if (!isStreamActive(streamStateRef.current)) return
     const prevId = activeConvIdRef.current
     streamAbortRef.current?.abort()
     streamAbortRef.current = null
+    if (stopTimeoutRef.current) { clearTimeout(stopTimeoutRef.current); stopTimeoutRef.current = null }
     if (prevId) ipc.invoke('stop:generation', { conversationId: prevId }).catch((err) => console.error('[App]', err))
     dispatchStream({ type: 'STOPPED' })
   }, [dispatchStream])
@@ -566,12 +569,16 @@ export default function App() {
 
     const unsubEnd = ipc.on('stream:end', (data: StreamEndPayload) => {
       if (data.conversationId !== activeConvIdRef.current) return
+      // C4: 清除 STOP_REQUESTED 超时守卫
+      if (stopTimeoutRef.current) { clearTimeout(stopTimeoutRef.current); stopTimeoutRef.current = null }
       dispatchStream({ type: 'STOPPED' })
       loadConversationsRef.current()
     })
 
     const unsubError = ipc.on('stream:error', (data: StreamErrorPayload) => {
       if (data.conversationId !== activeConvIdRef.current) return
+      // C4: 清除 STOP_REQUESTED 超时守卫
+      if (stopTimeoutRef.current) { clearTimeout(stopTimeoutRef.current); stopTimeoutRef.current = null }
       dispatchStream({ type: 'ERROR' })
       setMessages((prev) => {
         const last = prev[prev.length - 1]
@@ -580,6 +587,13 @@ export default function App() {
         }
         return [...prev, { id: crypto.randomUUID(), conversationId: data.conversationId, role: 'assistant' as const, content: `Error: ${data.error}`, timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }) }]
       })
+      // C3 修复：ERROR 状态 2 秒后自动恢复为 IDLE，用户可直接发送下一条消息
+      // 无需手动切会话或重启。
+      setTimeout(() => {
+        if (streamStateRef.current === 'ERROR') {
+          dispatchStream({ type: 'RESET' })
+        }
+      }, 2_000)
     })
 
     return () => { unsubChunk(); unsubEnd(); unsubError() }
@@ -760,6 +774,16 @@ export default function App() {
     if (activeConvId) {
       dispatchStream({ type: 'STOP_REQUESTED' })
       ipc.invoke('stop:generation', { conversationId: activeConvId })
+      // C4 修复：10 秒超时守卫。如果 stream:end/error 10 秒内未到达，
+      // 强制 STOPPED 防止 INTERRUPTING 状态永久锁死输入框。
+      if (stopTimeoutRef.current) clearTimeout(stopTimeoutRef.current)
+      stopTimeoutRef.current = setTimeout(() => {
+        stopTimeoutRef.current = null
+        if (streamStateRef.current === 'INTERRUPTING') {
+          console.warn('[App] Stop timeout — forcing STOPPED')
+          dispatchStream({ type: 'STOPPED' })
+        }
+      }, 10_000)
     }
   }
   stopRef.current = handleStop

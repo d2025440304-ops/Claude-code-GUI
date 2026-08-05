@@ -41,6 +41,7 @@ import { SessionWatcherManager, SessionEvent } from './integration/session-watch
 import { AgentSdkBridge } from './integration/agent-sdk-bridge';
 import { scanSkills, SkillInfo } from './integration/skills-scanner';
 import type { PermissionDecision } from './types/agent';
+import { mapPermissionModeForPty } from './ipc/permission-modes';
 
 // ---------------------------------------------------------------------------
 // IPC timeout helper — prevents handlers from hanging forever
@@ -1141,14 +1142,8 @@ function registerIpcHandlers(): void {
     }): { ok: boolean; error?: string } => {
       const { id, cwd, model, resumeSessionId, permissionMode, addDirs } = payload;
 
-      // 权限模式映射
-      const modeMap: Record<string, string> = {
-        'ask': 'default',
-        'auto-edit': 'acceptEdits',
-        'plan': 'plan',
-        'skip': 'bypassPermissions',
-      };
-      const cliPermissionMode = permissionMode ? modeMap[permissionMode] || undefined : undefined;
+      // 权限模式映射（使用共享映射）
+      const cliPermissionMode = mapPermissionModeForPty(permissionMode);
 
       const result = claudePtyManager.create(id, {
         cwd,

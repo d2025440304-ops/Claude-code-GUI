@@ -17,6 +17,7 @@ import type { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
 import path from 'path';
 import { resolveCwd } from './resolve-cwd';
+import { mapPermissionModeForSdk } from '../ipc/permission-modes';
 import type {
   AgentStatus,
   AgentEvent,
@@ -874,16 +875,7 @@ export class AgentSdkBridge {
   // -------------------------------------------------------------------------
 
   private mapPermissionMode(mode?: string): 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan' | 'dontAsk' | 'auto' {
-    switch (mode) {
-      case 'auto-edit': return 'acceptEdits';
-      case 'plan': return 'plan';
-      case 'skip': return 'bypassPermissions';
-      case 'auto': return 'auto';
-      case 'default':
-      case 'ask':
-      default:
-        return 'default';
-    }
+    return mapPermissionModeForSdk(mode) || 'default';
   }
 
   /** Map our ThinkingEffort to SDK EffortLevel. */
