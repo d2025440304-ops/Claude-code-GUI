@@ -3,6 +3,7 @@ import type { KeyboardEvent } from 'react'
 import { ipc } from '../lib/ipc'
 import { ArrowUp, FileCode, Sparkles, FolderOpen, Zap, Trash2, Plus, HelpCircle, Cpu, Square, Copy, Check, Paperclip, Image as ImageIcon, X as XIcon, Brain, Terminal, ChevronDown, AlertTriangle, GitBranch, Loader2 } from 'lucide-react'
 import { MarkdownContent, CodeBlockView } from '../lib/codeRenderer'
+import { ClaudeAvatar, UserAvatar } from './ChatAvatar'
 import type { Message, ModelOption, Attachment, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption, ContentBlock, DiffHunk } from '../types'
 import ControlBar from './ControlBar'
 import { buildSlashCommands } from '../lib/commands'
@@ -276,25 +277,28 @@ const UserAttachments = memo(function UserAttachments({ atts }: { atts: Attachme
 const UserMessage = memo(function UserMessage({ msg, idx }: { msg: Message; idx: number }) {
   const atts = msg.attachments ?? []
   return (
-    <div className="flex flex-col items-end gap-1.5 animate-fade-in" style={{ animationDelay: `${idx * 30}ms` }}>
-      {msg.content && (
-        <div
-          className="px-4 py-3 text-[14px] leading-relaxed"
-          style={{
-            background: 'linear-gradient(135deg, var(--accent-primary) 0%, #7c3aed 100%)',
-            borderRadius: '18px 18px 4px 18px',
-            maxWidth: '72%',
-            color: '#fff',
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-            boxShadow: '0 2px 8px rgba(99,102,241,0.25)',
-          }}
-        >
-          {msg.content}
-        </div>
-      )}
-      <UserAttachments atts={atts} />
-      <span className="text-[10px] px-1.5" style={{ color: 'var(--fg-quaternary)' }}>{fmtTime(msg.timestamp)}</span>
+    <div className="flex items-start justify-end gap-2.5 animate-fade-in" style={{ animationDelay: `${idx * 30}ms` }}>
+      <div className="flex flex-col items-end gap-1.5">
+        {msg.content && (
+          <div
+            className="px-4 py-3 text-[14px] leading-relaxed"
+            style={{
+              background: 'linear-gradient(135deg, var(--accent-primary) 0%, #7c3aed 100%)',
+              borderRadius: '18px 18px 4px 18px',
+              maxWidth: '72%',
+              color: '#fff',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              boxShadow: '0 2px 8px rgba(99,102,241,0.25)',
+            }}
+          >
+            {msg.content}
+          </div>
+        )}
+        <UserAttachments atts={atts} />
+        <span className="text-[10px] px-1.5" style={{ color: 'var(--fg-quaternary)' }}>{fmtTime(msg.timestamp)}</span>
+      </div>
+      <UserAvatar size={28} />
     </div>
   )
 })
@@ -316,7 +320,7 @@ const AssistantMessage = memo(function AssistantMessage({
     const text = hasBlocks
       ? blocks!.filter(b => b.type === 'text').map(b => b.content || '').join('')
       : msg.content
-    navigator.clipboard?.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) }).catch(() => {})
+    navigator.clipboard?.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) }).catch((err) => console.error('[ChatView] clipboard:', err))
   }
 
   return (
@@ -327,12 +331,8 @@ const AssistantMessage = memo(function AssistantMessage({
       onMouseLeave={() => setHovered(false)}
     >
       <div className="flex gap-3">
-        <div
-          className="flex-shrink-0 w-7 h-7 rounded-lg flex items-center justify-center"
-          style={{ background: 'linear-gradient(135deg, var(--accent-primary) 0%, #a855f7 100%)' }}
-        >
-          <Sparkles size={13} color="#fff" />
-        </div>
+        {/* Claude 头像 */}
+        <ClaudeAvatar size={28} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1.5">
             <span className="text-[12.5px] font-semibold" style={{ color: 'var(--fg-primary)' }}>Claude</span>

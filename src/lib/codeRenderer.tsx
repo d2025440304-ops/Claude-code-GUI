@@ -70,7 +70,7 @@ export const CodeBlockView = memo(function CodeBlockView({ language, code }: { l
   const lines = code.split('\n')
   const [copied, setCopied] = useState(false)
   const copy = () => {
-    navigator.clipboard?.writeText(code).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) }).catch(() => {})
+    navigator.clipboard?.writeText(code).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) }).catch((err) => console.error('[CodeBlock] clipboard:', err))
   }
   return (
     <div className="code-block" style={{ margin: '12px 0' }}>

@@ -214,7 +214,7 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
 
     // User input → PTY
     terminal.onData((data: string) => {
-      ipc.invoke('claude-pty:write', { id, data }).catch(() => {})
+      ipc.invoke('claude-pty:write', { id, data }).catch((err) => console.error('[ClaudeTerminalView]', err))
       setShowHelp(false)
     })
 
@@ -291,7 +291,7 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
       id,
       cols: terminal.cols,
       rows: terminal.rows,
-    }).catch(() => {})
+    }).catch((err) => console.error('[ClaudeTerminalView]', err))
 
     // Focus — aggressive: immediate + delayed to ensure terminal captures keyboard
     setTimeout(() => terminal.focus(), 50)
@@ -302,7 +302,7 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
   /** Restart session */
   const restartSession = useCallback(() => {
     // Kill old session
-    ipc.invoke('claude-pty:kill', { id: sessionIdRef.current }).catch(() => {})
+    ipc.invoke('claude-pty:kill', { id: sessionIdRef.current }).catch((err) => console.error('[ClaudeTerminalView]', err))
     // Clear session capture timer
     if (sessionCaptureTimerRef.current) {
       clearInterval(sessionCaptureTimerRef.current)
@@ -317,7 +317,7 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
 
   /** Send Ctrl+C (interrupt current operation) */
   const sendCtrlC = useCallback(() => {
-    ipc.invoke('claude-pty:send-key', { id: sessionIdRef.current, key: 'ctrl-c' }).catch(() => {})
+    ipc.invoke('claude-pty:send-key', { id: sessionIdRef.current, key: 'ctrl-c' }).catch((err) => console.error('[ClaudeTerminalView]', err))
   }, [])
 
   /** Clear terminal scrollback */
@@ -341,7 +341,7 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
   const respondToPermission = useCallback((optionIndex: number) => {
     const id = sessionIdRef.current
     if (id) {
-      ipc.invoke('claude-pty:write', { id, data: `${optionIndex}\n` }).catch(() => {})
+      ipc.invoke('claude-pty:write', { id, data: `${optionIndex}\n` }).catch((err) => console.error('[ClaudeTerminalView]', err))
     }
     setPermission(null)
   }, [])
@@ -368,7 +368,7 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
       // If component truly unmounts (conversation switch), the kill proceeds
       const sessionId = sessionIdRef.current
       killTimerRef.current = setTimeout(() => {
-        ipc.invoke('claude-pty:kill', { id: sessionId }).catch(() => {})
+        ipc.invoke('claude-pty:kill', { id: sessionId }).catch((err) => console.error('[ClaudeTerminalView]', err))
         killTimerRef.current = null
       }, 300)
     }
@@ -388,7 +388,7 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
             id: sessionIdRef.current,
             cols: term.cols,
             rows: term.rows,
-          }).catch(() => {})
+          }).catch((err) => console.error('[ClaudeTerminalView]', err))
         } catch {
           // ignore fit errors
         }

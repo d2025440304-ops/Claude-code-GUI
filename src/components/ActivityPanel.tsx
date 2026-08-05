@@ -379,7 +379,7 @@ export default function ActivityPanel({ convId, sessionId, cwd }: ActivityPanelP
         .then(res => {
           if (res?.events) setEvents(res.events)
         })
-        .catch(() => {})
+        .catch((err) => console.error('[ActivityPanel]', err))
     }
 
     // Subscribe to legacy session events

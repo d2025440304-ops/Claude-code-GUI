@@ -104,7 +104,7 @@ export default function TerminalView({ projectPath }: TerminalViewProps) {
 
     // 用户输入 → PTY
     terminal.onData((data: string) => {
-      ipc.invoke('terminal:write', { id, data }).catch(() => {})
+      ipc.invoke('terminal:write', { id, data }).catch((err) => console.error('[TerminalView]', err))
     })
 
     // 点击聚焦
@@ -117,7 +117,7 @@ export default function TerminalView({ projectPath }: TerminalViewProps) {
         id,
         cols: terminal.cols,
         rows: terminal.rows,
-      }).catch(() => {})
+      }).catch((err) => console.error('[TerminalView]', err))
     })
     resizeObserver.observe(containerEl)
 
@@ -152,7 +152,7 @@ export default function TerminalView({ projectPath }: TerminalViewProps) {
       id,
       cols: terminal.cols,
       rows: terminal.rows,
-    }).catch(() => {})
+    }).catch((err) => console.error('[TerminalView]', err))
 
     // 聚焦
     setTimeout(() => terminal.focus(), 100)
@@ -168,7 +168,7 @@ export default function TerminalView({ projectPath }: TerminalViewProps) {
     tab.unsubExit()
     tab.terminal.dispose()
     tab.containerEl.remove()
-    ipc.invoke('terminal:kill', { id: tabId }).catch(() => {})
+    ipc.invoke('terminal:kill', { id: tabId }).catch((err) => console.error('[TerminalView]', err))
 
     setTabs(prev => {
       const next = prev.filter(t => t.id !== tabId)
@@ -196,7 +196,7 @@ export default function TerminalView({ projectPath }: TerminalViewProps) {
           id: active.id,
           cols: active.terminal.cols,
           rows: active.terminal.rows,
-        }).catch(() => {})
+        }).catch((err) => console.error('[TerminalView]', err))
       }, 50)
     }
   }, [activeTabId])
@@ -213,7 +213,7 @@ export default function TerminalView({ projectPath }: TerminalViewProps) {
         tab.unsubData()
         tab.unsubExit()
         tab.terminal.dispose()
-        ipc.invoke('terminal:kill', { id: tab.id }).catch(() => {})
+        ipc.invoke('terminal:kill', { id: tab.id }).catch((err) => console.error('[TerminalView]', err))
       }
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps

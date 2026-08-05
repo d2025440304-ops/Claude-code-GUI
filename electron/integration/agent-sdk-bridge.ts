@@ -677,7 +677,9 @@ export class AgentSdkBridge {
       suggestions: options.suggestions as unknown[],
     });
 
-    // Wait for the renderer's decision
+    // Wait for the renderer's decision with a 5-minute timeout guard
+    // to prevent permanent session hang if the renderer never responds.
+    const PERMISSION_TIMEOUT_MS = 5 * 60 * 1000;
     return new Promise<PermissionResult>((resolve, reject) => {
       const request = {
         requestId: options.requestId,
@@ -694,7 +696,28 @@ export class AgentSdkBridge {
         reject(new Error('Aborted'));
       };
       options.signal.addEventListener('abort', abortListener);
-      state.pendingPermissions.set(options.requestId, { resolve, reject, request, signal: options.signal, abortListener });
+
+      // 自动超时守卫：如果 renderer 5 分钟内不响应，自动 deny 防止永久挂起
+      const timeoutTimer = setTimeout(() => {
+        state.pendingPermissions.delete(options.requestId);
+        try { options.signal.removeEventListener('abort', abortListener); } catch { /* ignore */ }
+        console.warn(`[AgentBridge] Permission request ${options.requestId} (${toolName}) timed out — auto-denying`);
+        resolve({ behavior: 'deny', message: 'Permission request timed out (5 min)' });
+      }, PERMISSION_TIMEOUT_MS);
+
+      state.pendingPermissions.set(options.requestId, {
+        resolve: (result) => {
+          clearTimeout(timeoutTimer);
+          resolve(result);
+        },
+        reject: (err) => {
+          clearTimeout(timeoutTimer);
+          reject(err);
+        },
+        request,
+        signal: options.signal,
+        abortListener,
+      });
     });
   }
 

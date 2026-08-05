@@ -6,6 +6,7 @@ import {
   Globe, Brain, Sparkles, ListTodo,
 } from 'lucide-react';
 import { MarkdownContent } from '../lib/codeRenderer';
+import { ClaudeAvatar, UserAvatar } from './ChatAvatar';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -23,6 +24,9 @@ export interface AgentMessageBlock {
   toolResult?: string;
   toolError?: boolean;
   filePath?: string;
+  /** bash 输出（持久化恢复用） */
+  stdout?: string;
+  stderr?: string;
   diff?: string[];
   isStreaming?: boolean;
   status?: 'running' | 'completed' | 'error';
@@ -79,22 +83,25 @@ function UserTextBlock({ text, attachments }: { text: string; attachments?: Atta
       style={{
         display: 'flex',
         justifyContent: 'flex-end',
+        alignItems: 'flex-start',
+        gap: 10,
         marginBottom: 24,
       }}
       className="message-enter"
     >
+      {/* 消息气泡（右侧） */}
       <div
         style={{
           maxWidth: '70%',
-          background: 'var(--accent-subtle, rgba(124,91,245,0.08))',
-          border: '1px solid rgba(124,91,245,0.12)',
-          borderRadius: '16px 16px 4px 16px',
+          background: 'linear-gradient(135deg, var(--accent-primary) 0%, #7c3aed 100%)',
+          borderRadius: '18px 18px 4px 18px',
           padding: '12px 16px',
           fontSize: 13.5,
           lineHeight: 1.65,
-          color: 'var(--fg-primary)',
+          color: '#fff',
           whiteSpace: 'pre-wrap',
           wordBreak: 'break-word',
+          boxShadow: '0 2px 8px rgba(99,102,241,0.25)',
         }}
       >
         {attachments && attachments.length > 0 && (
@@ -106,7 +113,7 @@ function UserTextBlock({ text, attachments }: { text: string; attachments?: Atta
                     key={att.id}
                     src={att.dataUrl}
                     alt={att.name}
-                    style={{ width: 96, height: 96, objectFit: 'cover', borderRadius: 10, border: '1px solid rgba(124,91,245,0.2)' }}
+                    style={{ width: 96, height: 96, objectFit: 'cover', borderRadius: 10, border: '1px solid rgba(255,255,255,0.25)' }}
                   />
                 );
               }
@@ -114,7 +121,7 @@ function UserTextBlock({ text, attachments }: { text: string; attachments?: Atta
                 <span
                   key={att.id}
                   className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[11px]"
-                  style={{ background: 'rgba(124,91,245,0.12)', border: '1px solid rgba(124,91,245,0.2)', color: 'var(--fg-secondary)' }}
+                  style={{ background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.2)', color: '#fff' }}
                 >
                   <FileCode size={11} />
                   {att.name}
@@ -125,6 +132,8 @@ function UserTextBlock({ text, attachments }: { text: string; attachments?: Atta
         )}
         {text}
       </div>
+      {/* 用户头像（最右侧） */}
+      <UserAvatar size={28} />
     </div>
   )
 }
@@ -137,14 +146,33 @@ function TextBlock({ text, isStreaming }: { text: string; isStreaming?: boolean 
   return (
     <div
       style={{
-        fontSize: 13.5,
-        lineHeight: 1.65,
-        color: 'var(--fg-primary)',
-        marginBottom: 12,
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: 10,
+        marginBottom: 16,
       }}
-      className={`prose message-enter ${isStreaming ? 'streaming-cursor' : ''}`}
+      className="message-enter"
     >
-      <MarkdownContent text={text} />
+      {/* Claude 头像（最左侧） */}
+      <ClaudeAvatar size={28} />
+      {/* 内容气泡 */}
+      <div
+        className={`prose ${isStreaming ? 'streaming-cursor' : ''}`}
+        style={{
+          fontSize: 13.5,
+          lineHeight: 1.65,
+          color: 'var(--fg-primary)',
+          background: 'var(--bg-elevated)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: '4px 18px 18px 18px',
+          padding: '12px 16px',
+          minWidth: 0,
+          maxWidth: '100%',
+          flex: 1,
+        }}
+      >
+        <MarkdownContent text={text} />
+      </div>
     </div>
   );
 }
@@ -157,7 +185,7 @@ function ThinkingBlock({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div style={{ marginBottom: 8 }}>
+    <div style={{ marginBottom: 8, paddingLeft: 38 }}>
       <button
         onClick={() => setExpanded(!expanded)}
         style={{
@@ -215,6 +243,7 @@ function ToolUseBlock({ block }: { block: AgentMessageBlock }) {
         borderRadius: 12,
         border: `1px solid ${isError ? 'rgba(255,69,58,0.2)' : 'var(--border-subtle)'}`,
         marginBottom: 8,
+        marginLeft: 38,
         overflow: 'hidden',
         background: 'var(--bg-elevated)',
       }}
@@ -423,7 +452,8 @@ function ContentStats({ input }: { input?: Record<string, unknown> }) {
 // ---------------------------------------------------------------------------
 
 function ToolResultBlock({ block }: { block: AgentMessageBlock }) {
-  const text = extractTextContent(block.content || block.toolResult);
+  // 优先结构化 stdout（持久化恢复后 Bash 输出完整可见），再回退 content
+  const text = extractTextContent(block.stdout || block.content || block.toolResult);
   if (!block.toolError && !text) return null;
 
   const name = block.toolName || '';

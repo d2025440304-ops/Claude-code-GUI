@@ -1,7 +1,13 @@
-import { Component, ErrorInfo, ReactNode } from 'react'
+/**
+ * 真正的 Error Boundary — 捕获 React 渲染异常，显示恢复界面并上报。
+ */
+import { Component, type ErrorInfo, type ReactNode } from 'react'
+import { AlertTriangle, RefreshCw } from 'lucide-react'
 
 interface Props {
   children: ReactNode
+  fallback?: ReactNode
+  onError?: (error: Error, info: ErrorInfo) => void
 }
 
 interface State {
@@ -9,10 +15,6 @@ interface State {
   error: Error | null
 }
 
-/**
- * 全局错误边界：捕获子组件渲染期间抛出的错误，避免整个应用白屏。
- * 提供重试按钮重置内部状态。
- */
 export default class ErrorBoundary extends Component<Props, State> {
   constructor(props: Props) {
     super(props)
@@ -24,28 +26,73 @@ export default class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
-    console.error('[ErrorBoundary] 捕获到渲染错误:', error, info)
+    console.error('[ErrorBoundary] Uncaught error:', error, info)
+    this.props.onError?.(error, info)
   }
 
-  handleReset = (): void => {
+  handleReset = () => {
     this.setState({ hasError: false, error: null })
   }
 
-  render(): ReactNode {
-    if (!this.state.hasError) return this.props.children
-    return (
-      <div style={{ padding: 40, textAlign: 'center', color: 'var(--fg-secondary)', height: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
-        <h2 style={{ marginBottom: 12, color: 'var(--fg-primary)' }}>Something went wrong</h2>
-        <p style={{ marginBottom: 8, color: 'var(--fg-tertiary)', fontSize: 13, maxWidth: 480, wordBreak: 'break-word' }}>
-          {this.state.error?.message || 'An unexpected error occurred'}
-        </p>
-        <p style={{ marginBottom: 20, color: 'var(--fg-quaternary)', fontSize: 11 }}>
-          Check the console for details
-        </p>
-        <button onClick={this.handleReset} className="btn btn-primary">
-          Try Again
-        </button>
-      </div>
-    )
+  handleReload = () => {
+    window.location.reload()
+  }
+
+  render() {
+    if (this.state.hasError) {
+      if (this.props.fallback) return this.props.fallback
+
+      return (
+        <div
+          className="flex flex-col items-center justify-center gap-4 p-8"
+          style={{
+            minHeight: 300,
+            background: 'var(--bg-surface-1)',
+            borderRadius: 12,
+            border: '1px solid rgba(239,68,68,0.2)',
+          }}
+        >
+          <AlertTriangle size={32} style={{ color: '#ef4444' }} />
+          <div className="text-center">
+            <h2 className="text-[16px] font-semibold" style={{ color: 'var(--fg-primary)' }}>
+              渲染异常
+            </h2>
+            <p className="text-[12px] mt-1" style={{ color: 'var(--fg-tertiary)', maxWidth: 400 }}>
+              {this.state.error?.message || '发生了意外的渲染错误'}
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={this.handleReset}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium transition-colors"
+              style={{ background: 'var(--tint-subtle)', color: 'var(--fg-secondary)' }}
+            >
+              <RefreshCw size={12} />
+              重试
+            </button>
+            <button
+              onClick={this.handleReload}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium transition-colors"
+              style={{ background: 'rgba(99,102,241,0.12)', color: 'var(--accent-bright)' }}
+            >
+              <RefreshCw size={12} />
+              重新加载
+            </button>
+          </div>
+          {this.state.error?.stack && (
+            <details className="w-full max-w-lg">
+              <summary className="text-[10px] cursor-pointer" style={{ color: 'var(--fg-quaternary)' }}>
+                错误详情
+              </summary>
+              <pre className="mt-1 p-2 rounded text-[10px] font-mono overflow-auto max-h-40" style={{ background: 'var(--code-bg)', color: 'var(--fg-tertiary)' }}>
+                {this.state.error.stack}
+              </pre>
+            </details>
+          )}
+        </div>
+      )
+    }
+
+    return this.props.children
   }
 }

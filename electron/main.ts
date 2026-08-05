@@ -33,7 +33,7 @@ import type { StreamChunkPayload, StreamEndPayload, StreamErrorPayload } from '.
 import { AppDatabase } from './db/database';
 import { ConversationRepo, Conversation } from './db/repositories/conversation-repo';
 import { MessageRepo, Message, Attachment } from './db/repositories/message-repo';
-import type { ParsedChunk } from './integration/stream-parser';
+import type { ParsedChunk, DiffHunk } from './integration/stream-parser';
 import { scanHistorySummaries, loadConversationDetail, HistoryConversation, HistoryConversationDetail } from './integration/history-scanner';
 import { PtyManager } from './integration/pty-manager';
 import { ClaudePtyManager, ClaudePtyPermission } from './integration/claude-pty-manager';
@@ -41,6 +41,34 @@ import { SessionWatcherManager, SessionEvent } from './integration/session-watch
 import { AgentSdkBridge } from './integration/agent-sdk-bridge';
 import { scanSkills, SkillInfo } from './integration/skills-scanner';
 import type { PermissionDecision } from './types/agent';
+
+// ---------------------------------------------------------------------------
+// IPC timeout helper — prevents handlers from hanging forever
+// ---------------------------------------------------------------------------
+
+/** Default timeout for IPC handlers (30s). */
+const IPC_TIMEOUT_MS = 30_000;
+
+/**
+ * Wrap an ipcMain.handle registration with a timeout guard.
+ * If the handler doesn't respond within IPC_TIMEOUT_MS, the promise rejects
+ * with a descriptive error instead of hanging the renderer forever.
+ */
+function registerIpcHandler<T>(
+  channel: string,
+  handler: (event: IpcMainInvokeEvent, payload: T) => unknown,
+  timeoutMs = IPC_TIMEOUT_MS,
+): void {
+  ipcMain.handle(channel, async (event: IpcMainInvokeEvent, payload: T) => {
+    const result = await Promise.race([
+      Promise.resolve(handler(event, payload)),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`IPC handler "${channel}" timed out after ${timeoutMs}ms`)), timeoutMs),
+      ),
+    ]);
+    return result;
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Constants & module state
@@ -100,6 +128,72 @@ const textAccumulators = new Map<string, string>();
 
 /** DB id of the in-flight assistant message per conversation id. */
 const assistantMessageIds = new Map<string, string>();
+
+/** Chat 模式结构化块累积（thinking/tool_use/tool_result），与 Agent 持久化格式统一 */
+const chatContentBlocks = new Map<string, ChatContentBlock[]>();
+
+/**
+ * 把流式 chunk 累积成结构化块（Chat 模式）。
+ * text 继续走 textAccumulators（作为 JSON 的第一个 text part），
+ * 这里只累积 thinking / tool_use / tool_result / permission_denial。
+ */
+function accumulateChatBlock(convId: string, chunk: ParsedChunk): void {
+  const blocks = chatContentBlocks.get(convId) || [];
+  const last = blocks[blocks.length - 1];
+
+  switch (chunk.type) {
+    case 'thinking': {
+      // thinking 是增量流：累积到最后一个 thinking 块（字段用 text，与 Agent 一致）
+      if (last && last.type === 'thinking' && last.status === 'streaming') {
+        last.text = (last.text || '') + (chunk.content || '');
+      } else {
+        blocks.push({ type: 'thinking', text: chunk.content || '', status: 'streaming' });
+      }
+      break;
+    }
+    case 'tool_use': {
+      if (chunk.input !== undefined) {
+        // content_block_stop：完整 input
+        let input: Record<string, unknown> = {};
+        try { input = JSON.parse(chunk.input) as Record<string, unknown>; } catch { /* 保持空 */ }
+        const existing = blocks.find((b) => b.type === 'tool_use' && b.toolUseId === chunk.toolUseId);
+        if (existing) {
+          existing.input = input;
+          existing.status = 'completed';
+        } else {
+          blocks.push({ type: 'tool_use', toolName: chunk.tool, toolUseId: chunk.toolUseId, input, status: 'completed' });
+        }
+      } else if (!blocks.some((b) => b.type === 'tool_use' && b.toolUseId === chunk.toolUseId)) {
+        // blockStart：占位（等 stop 补 input），同 id 不重复
+        blocks.push({ type: 'tool_use', toolName: chunk.tool, toolUseId: chunk.toolUseId, status: 'streaming' });
+      }
+      break;
+    }
+    case 'tool_result': {
+      blocks.push({
+        type: 'tool_result',
+        toolUseId: chunk.toolUseId,
+        content: chunk.content,
+        stdout: chunk.stdout,
+        stderr: chunk.stderr,
+        isError: chunk.isError,
+        diff: chunk.diff,
+        filePath: chunk.filePath,
+        status: chunk.isError ? 'error' : 'completed',
+      });
+      const tu = blocks.find((b) => b.type === 'tool_use' && b.toolUseId === chunk.toolUseId);
+      if (tu) tu.status = chunk.isError ? 'error' : 'completed';
+      break;
+    }
+    case 'permission_denial': {
+      blocks.push({ type: 'permission_denial', content: chunk.content, toolName: chunk.tool, status: 'error' });
+      break;
+    }
+    default:
+      return; // text/meta/error 不累积
+  }
+  chatContentBlocks.set(convId, blocks);
+}
 
 /** Throttle timers that flush accumulated text to the database. */
 const flushTimers = new Map<string, NodeJS.Timeout>();
@@ -279,21 +373,53 @@ function createWindow(convId?: string): BrowserWindow {
 // Stream listener wiring
 // ---------------------------------------------------------------------------
 
+/** 与渲染进程 ContentBlock 对齐的结构化块（Chat 模式持久化用，格式与 Agent 一致） */
+interface ChatContentBlock {
+  type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'permission_denial'
+  /** thinking 的完整文本（字段名 text 与 Agent 持久化格式一致） */
+  text?: string
+  content?: string
+  toolName?: string
+  /** tool_use 的完整输入（字段名 input 与 Agent 持久化格式一致） */
+  input?: Record<string, unknown>
+  toolUseId?: string
+  stdout?: string
+  stderr?: string
+  isError?: boolean
+  diff?: DiffHunk[]
+  filePath?: string
+  status?: 'streaming' | 'completed' | 'error'
+}
+
 /**
  * Write the accumulated assistant text for a conversation to its database
  * message row (creating the row lazily on the first chunk). Called both on a
  * throttle and on stream close so partial responses survive a crash.
+ *
+ * 统一持久化格式：content = JSON 数组（[{type:'text'}, ...blocks]），
+ * 与 Agent 模式完全一致 —— 两种模式共用同一个数据库，消息互通。
  */
 function flushAssistantText(conversationId: string): void {
   const text = textAccumulators.get(conversationId);
-  if (!text) return;
+  const blocks = chatContentBlocks.get(conversationId);
   const msgId = assistantMessageIds.get(conversationId);
   try {
+    // 流式中的 thinking/tool_use 块在持久化时终结为 completed
+    if (blocks) {
+      for (const b of blocks) {
+        if (b.status === 'streaming') b.status = 'completed';
+      }
+    }
+    const contentParts: unknown[] = [];
+    if (text && text.trim()) contentParts.push({ type: 'text', text: text.trim() });
+    if (blocks && blocks.length > 0) contentParts.push(...blocks);
+    const serialized = contentParts.length > 0 ? JSON.stringify(contentParts) : (text || '');
+    if (!serialized) return;
     if (!msgId) {
-      const msg = messageRepo.create(conversationId, 'assistant', text);
+      const msg = messageRepo.create(conversationId, 'assistant', serialized);
       assistantMessageIds.set(conversationId, msg.id);
     } else {
-      messageRepo.updateContent(msgId, text);
+      messageRepo.updateContent(msgId, serialized);
     }
   } catch (err) {
     console.error('[Main] Failed to persist assistant text:', err);
@@ -316,6 +442,7 @@ function clearSessionState(conversationId: string): void {
   if (timer) { clearTimeout(timer); flushTimers.delete(conversationId); }
   textAccumulators.delete(conversationId);
   assistantMessageIds.delete(conversationId);
+  chatContentBlocks.delete(conversationId);
   typingStarted.delete(conversationId);
 }
 
@@ -337,6 +464,24 @@ function flushAllPending(): void {
 const agentTextAccum = new Map<string, string>();
 const agentAssistantMsgIds = new Map<string, string>();
 const agentContentBlocks = new Map<string, unknown[]>();
+/** 持久化队列锁 — 防止并发事件导致数据丢失 */
+const agentPersistenceQueue = new Map<string, Promise<void>>();
+
+/**
+ * 串行化 agent 持久化操作，避免并发事件导致数据丢失。
+ * 每个 conversation 的持久化操作排队执行。
+ */
+function enqueueAgentPersistence(convId: string, fn: () => Promise<void>): void {
+  const prev = agentPersistenceQueue.get(convId) || Promise.resolve();
+  const next = prev.then(fn, fn); // 即使前一个失败也继续执行
+  agentPersistenceQueue.set(convId, next);
+  // 清理已完成的 promise
+  next.finally(() => {
+    if (agentPersistenceQueue.get(convId) === next) {
+      agentPersistenceQueue.delete(convId);
+    }
+  });
+}
 
 function flushAgentMessages(convId: string): void {
   const text = agentTextAccum.get(convId);
@@ -398,6 +543,12 @@ function setupStreamListeners(): void {
     if (chunk.type === 'text' && chunk.content) {
       const prev = textAccumulators.get(conversationId) ?? '';
       textAccumulators.set(conversationId, prev + chunk.content);
+      scheduleFlush(conversationId);
+    }
+
+    // 结构化块累积（thinking/tool_use/tool_result）→ 与 Agent 持久化格式统一
+    if (chunk.type === 'thinking' || chunk.type === 'tool_use' || chunk.type === 'tool_result' || chunk.type === 'permission_denial') {
+      accumulateChatBlock(conversationId, chunk);
       scheduleFlush(conversationId);
     }
 
@@ -519,7 +670,7 @@ function registerIpcHandlers(): void {
     return conversationRepo.getAll();
   });
 
-  ipcMain.handle(
+  registerIpcHandler<ConversationCreatePayload>(
     Channels.CONVERSATION_CREATE,
     (_e: IpcMainInvokeEvent, payload: ConversationCreatePayload): Conversation => {
      const title = payload.title?.trim() || 'New Conversation';
@@ -687,7 +838,7 @@ function registerIpcHandlers(): void {
     },
   );
 
-  ipcMain.handle(
+  registerIpcHandler<MessageSendPayload>(
     Channels.MESSAGE_SEND,
     async (
       _e: IpcMainInvokeEvent,
@@ -1266,58 +1417,59 @@ function registerIpcHandlers(): void {
 
   // Wire up the bridge event callback to push events to the renderer + persist
   agentBridge.onEvent((convId, event) => {
-    // --- Persistence logic ---
-    switch (event.type) {
-      case 'text': {
-        // Full text block from assistant message
-        const prev = agentTextAccum.get(convId) || '';
-        agentTextAccum.set(convId, prev + (event as any).text);
-        break;
+    // --- Persistence logic (serialized via queue to prevent race conditions) ---
+    enqueueAgentPersistence(convId, async () => {
+      switch (event.type) {
+        case 'text': {
+          // Full text block from assistant message
+          const prev = agentTextAccum.get(convId) || '';
+          agentTextAccum.set(convId, prev + (event as any).text);
+          break;
+        }
+        case 'text_delta': {
+          // Streaming delta — accumulate
+          const prev = agentTextAccum.get(convId) || '';
+          agentTextAccum.set(convId, prev + (event as any).delta);
+          break;
+        }
+        case 'tool_use': {
+          // Persist tool_use as structured content block
+          const blocks = agentContentBlocks.get(convId) || [];
+          blocks.push({
+            type: 'tool_use',
+            toolName: (event as any).toolName,
+            toolUseId: (event as any).toolUseId,
+            input: (event as any).input,
+          });
+          agentContentBlocks.set(convId, blocks);
+          break;
+        }
+        case 'tool_result': {
+          // Persist tool_result
+          const blocks = agentContentBlocks.get(convId) || [];
+          blocks.push({
+            type: 'tool_result',
+            toolUseId: (event as any).toolUseId,
+            content: (event as any).content,
+            isError: (event as any).isError,
+          });
+          agentContentBlocks.set(convId, blocks);
+          break;
+        }
+        case 'thinking': {
+          const blocks = agentContentBlocks.get(convId) || [];
+          blocks.push({ type: 'thinking', text: (event as any).text });
+          agentContentBlocks.set(convId, blocks);
+          break;
+        }
+        case 'result': {
+          // Turn complete — flush all accumulated messages
+          flushAgentMessages(convId);
+          broadcast(Channels.CONVERSATIONS_CHANGED);
+          break;
+        }
       }
-      case 'text_delta': {
-        // Streaming delta — accumulate
-        const prev = agentTextAccum.get(convId) || '';
-        agentTextAccum.set(convId, prev + (event as any).delta);
-        break;
-      }
-      case 'tool_use': {
-        // Persist tool_use as structured content block
-        const blocks = agentContentBlocks.get(convId) || [];
-        blocks.push({
-          type: 'tool_use',
-          toolName: (event as any).toolName,
-          toolUseId: (event as any).toolUseId,
-          input: (event as any).input,
-        });
-        agentContentBlocks.set(convId, blocks);
-        // Also persist user message (the prompt that triggered this turn)
-        break;
-      }
-      case 'tool_result': {
-        // Persist tool_result
-        const blocks = agentContentBlocks.get(convId) || [];
-        blocks.push({
-          type: 'tool_result',
-          toolUseId: (event as any).toolUseId,
-          content: (event as any).content,
-          isError: (event as any).isError,
-        });
-        agentContentBlocks.set(convId, blocks);
-        break;
-      }
-      case 'thinking': {
-        const blocks = agentContentBlocks.get(convId) || [];
-        blocks.push({ type: 'thinking', text: (event as any).text });
-        agentContentBlocks.set(convId, blocks);
-        break;
-      }
-      case 'result': {
-        // Turn complete — flush all accumulated messages
-        flushAgentMessages(convId);
-        broadcast(Channels.CONVERSATIONS_CHANGED);
-        break;
-      }
-    }
+    });
 
     // --- Push to renderer ---
     for (const [winId, boundConvId] of windowBindings) {

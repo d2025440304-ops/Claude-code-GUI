@@ -102,6 +102,9 @@ function restoreBlocksFromMessages(messages: Array<{ role: string; content: stri
           existing.status = p.isError ? 'error' : 'completed';
           existing.toolResult = p.content as string;
           existing.toolError = !!p.isError;
+          existing.stdout = p.stdout as string | undefined;
+          existing.stderr = p.stderr as string | undefined;
+          existing.filePath = p.filePath as string | undefined;
         } else {
           blocks.push({
             id: `r-tr-${blocks.length}`,
@@ -109,6 +112,9 @@ function restoreBlocksFromMessages(messages: Array<{ role: string; content: stri
             toolUseId: p.toolUseId as string,
             content: p.content as string,
             toolError: !!p.isError,
+            stdout: p.stdout as string | undefined,
+            stderr: p.stderr as string | undefined,
+            filePath: p.filePath as string | undefined,
           });
         }
       }
@@ -267,10 +273,13 @@ export default function AgentConversationView({
         } catch { /* ignore */ }
       }
       setIsInitialized(true);
+      // 修复：恢复完成后自动滚动到底部（最新消息），
+      // 避免切换会话时停留在顶部需要手动翻很久
+      setTimeout(() => scrollToBottom(), 100);
     } catch (err) {
       setError(`Failed to create agent session: ${err}`);
     }
-  }, [conversationId, cwd, model, permissionMode, thinkingEffort]);
+  }, [conversationId, cwd, model, permissionMode, thinkingEffort, scrollToBottom]);
 
   // Session lifecycle: init on mount. The agent session is kept alive in the
   // backend when the view unmounts (tab switch) so the agent keeps running.

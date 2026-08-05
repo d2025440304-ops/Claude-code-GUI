@@ -61,7 +61,7 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
         setExpandedDirs(new Set([projectPath]))
         if (result) setDirContents(new Map([[projectPath, result]]))
       })
-      .catch(() => {})
+      .catch((err) => console.error('[FileExplorer]', err))
       .finally(() => setLoading(false))
   }, [projectPath])
 
@@ -89,7 +89,7 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
               .then(result => {
                 if (result) setDirContents(prev2 => new Map(prev2).set(dirPath, result))
               })
-              .catch(() => {})
+              .catch((err) => console.error('[FileExplorer]', err))
           }
           return next
         })
@@ -113,7 +113,7 @@ export default function FileExplorer({ projectPath }: FileExplorerProps) {
               .then(result => {
                 if (result) setDirContents(prev2 => new Map(prev2).set(dirPath, result))
               })
-              .catch(() => {})
+              .catch((err) => console.error('[FileExplorer]', err))
           }
           return next
         })

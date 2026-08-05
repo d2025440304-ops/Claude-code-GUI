@@ -8,11 +8,14 @@ import ConversationItem from './components/ConversationItem'
 import ModelSelector from './components/ModelSelector'
 import ProjectSelector from './components/ProjectSelector'
 import ConfirmDialog from './components/ConfirmDialog'
+import ErrorBoundary from './components/ErrorBoundary'
+import ToastContainer from './components/ToastContainer'
+import { useToastStore } from './stores/toastStore'
 import { ipc, Channels } from './lib/ipc'
 import type { StreamChunk, StreamChunkPayload, StreamEndPayload, StreamErrorPayload } from './lib/ipc'
 import type { StreamState, StreamMachineEvent } from './lib/streamMachine'
 import { reduce as reduceStreamState, isStreamActive } from './lib/streamMachine'
-import type { Conversation, Message, Attachment, HistoryConversation, HistoryConversationDetail, PermissionMode, ThinkingEffort, ModelOption, ContentBlock } from './types'
+import type { Conversation, Message, Attachment, HistoryConversation, HistoryConversationDetail, PermissionMode, ThinkingEffort, ModelOption, ContentBlock, DiffHunk } from './types'
 import { MODELS, PERMISSION_MODES, THINKING_EFFORTS } from './types'
 import { SkeletonConversationList } from './components/Skeleton'
 
@@ -158,10 +161,18 @@ function deserializeMessageBlocks(msg: Message): Message {
       })
     } else if (t === 'tool_result') {
       const idx = blocks.findIndex(b => b.toolUseId === p.toolUseId && b.type === 'tool_use')
+      const result = {
+        content: p.content as string | undefined,
+        stdout: p.stdout as string | undefined,
+        stderr: p.stderr as string | undefined,
+        isError: !!p.isError,
+        diff: p.diff as DiffHunk[] | undefined,
+        filePath: p.filePath as string | undefined,
+      }
       if (idx >= 0) {
-        blocks[idx] = { ...blocks[idx], content: p.content as string, isError: !!p.isError, status: (p.isError ? 'error' : 'completed') }
+        blocks[idx] = { ...blocks[idx], ...result, status: (p.isError ? 'error' : 'completed') }
       } else {
-        blocks.push({ id: `db-${i}`, type: 'tool_result', toolUseId: p.toolUseId as string, content: p.content as string, isError: !!p.isError, status: 'completed' })
+        blocks.push({ id: `db-${i}`, type: 'tool_result', toolUseId: p.toolUseId as string, ...result, status: 'completed' })
       }
     }
     i++
@@ -244,7 +255,7 @@ export default function App() {
           setApiKey(res.value)
         }
       })
-      .catch(() => {})
+      .catch((err) => console.error('[App]', err))
   }, [])
   // 权限模式
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => {
@@ -306,7 +317,7 @@ export default function App() {
     const prevId = activeConvIdRef.current
     streamAbortRef.current?.abort()
     streamAbortRef.current = null
-    if (prevId) ipc.invoke('stop:generation', { conversationId: prevId }).catch(() => {})
+    if (prevId) ipc.invoke('stop:generation', { conversationId: prevId }).catch((err) => console.error('[App]', err))
     dispatchStream({ type: 'STOPPED' })
   }, [dispatchStream])
 
@@ -337,7 +348,7 @@ export default function App() {
 
   /* ---- 加载 Claude Code 历史对话 ---- */
   useEffect(() => {
-    ipc.invoke<HistoryConversation[]>('history:scan').then(setHistoryConvs).catch(() => {})
+    ipc.invoke<HistoryConversation[]>('history:scan').then(setHistoryConvs).catch((err) => console.error('[App]', err))
   }, [])
 
   useEffect(() => { try { localStorage.setItem('ccd:historyExpanded', JSON.stringify(Array.from(historyExpanded))) } catch {} }, [historyExpanded])
@@ -413,14 +424,14 @@ export default function App() {
   // Bind this window's active conversation to the main process so stream
   // chunks are routed here. Re-binds whenever the active conversation changes.
   useEffect(() => {
-    ipc.invoke('window:bind', { convId: activeConvId }).catch(() => {})
+    ipc.invoke('window:bind', { convId: activeConvId }).catch((err) => console.error('[App]', err))
   }, [activeConvId])
 
   // Stop session watcher when switching conversations (the new one will be started on sessionId capture)
   const prevConvIdRef = useRef<string | null>(null)
   useEffect(() => {
     if (prevConvIdRef.current && prevConvIdRef.current !== activeConvId) {
-      ipc.invoke('session-watcher:stop', { id: prevConvIdRef.current }).catch(() => {})
+      ipc.invoke('session-watcher:stop', { id: prevConvIdRef.current }).catch((err) => console.error('[App]', err))
     }
     prevConvIdRef.current = activeConvId
   }, [activeConvId])
@@ -585,7 +596,7 @@ export default function App() {
           setActiveConvId(null)
           setMessages([])
         }
-      }).catch(() => {})
+      }).catch((err) => console.error('[App]', err))
     })
     return unsub
   }, [])
@@ -1313,6 +1324,7 @@ export default function App() {
       </aside>
 
       {/* Right: Chat area */}
+      <ErrorBoundary>
       <main className="flex-1 flex flex-col overflow-hidden" style={{ minWidth: '320px', isolation: 'isolate' }}>
         {/* Header */}
         <header
@@ -1445,7 +1457,7 @@ export default function App() {
             onThinkingEffortChange={setThinkingEffort}
             onSessionIdChange={(sid) => {
               if (activeConvId && activeConv?.claudeSessionId !== sid) {
-                ipc.invoke('conversation:set-session-id', { id: activeConvId, sessionId: sid }).catch(() => {})
+                ipc.invoke('conversation:set-session-id', { id: activeConvId, sessionId: sid }).catch((err) => console.error('[App]', err))
               }
             }}
             onOpenActivity={() => setRightPanelOpen(true)}
@@ -1482,6 +1494,7 @@ export default function App() {
           />
         )}
       </main>
+      </ErrorBoundary>
 
       {/* Right panel */}
       {rightPanelOpen && (
@@ -1661,7 +1674,7 @@ export default function App() {
                             onClick={() => {
                               const next = !skillsEnabled
                               setSkillsEnabled(next)
-                              ipc.invoke('settings:set', { key: 'skillsEnabled', value: next }).catch(() => {})
+                              ipc.invoke('settings:set', { key: 'skillsEnabled', value: next }).catch((err) => console.error('[App]', err))
                             }}
                           >
                             <div className="flex flex-col gap-0.5">
@@ -1781,7 +1794,7 @@ export default function App() {
                             onClick={() => {
                               ipc.invoke('settings:set', { key: 'apiKey', value: apiKey })
                                 .then(() => { setApiKeySaved(true); setTimeout(() => setApiKeySaved(false), 2000) })
-                                .catch(() => {})
+                                .catch((err) => console.error('[App]', err))
                             }}
                             className="px-3 py-2 rounded-lg text-[11px] font-medium transition-all flex items-center gap-1.5"
                             style={{
@@ -1898,6 +1911,8 @@ export default function App() {
           onCancel={() => setConfirmDialog(null)}
         />
       )}
+      {/* Global toast notifications */}
+      <ToastContainer />
     </div>
   )
 }
