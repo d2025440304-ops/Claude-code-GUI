@@ -173,6 +173,23 @@ interface SessionState {
 
 type EventCallback = (convId: string, event: AgentEvent) => void;
 
+/**
+ * A5 修复：Agent session 是否允许接收新消息。
+ * 与 sendMessage 内部守卫使用同一判定（idle/completed 才可发送），
+ * 供主进程在持久化 user message 之前原子确认，避免快速连发产生幽灵消息。
+ */
+export function canAcceptMessage(
+  status: AgentStatus | undefined,
+): { ok: boolean; error?: string } {
+  if (status === undefined) {
+    return { ok: false, error: 'Agent session is not initialized. Please try again.' };
+  }
+  if (status !== 'idle' && status !== 'completed') {
+    return { ok: false, error: `Agent is busy (${status}). Please wait for the current turn to finish.` };
+  }
+  return { ok: true };
+}
+
 // ---------------------------------------------------------------------------
 // Bridge class
 // ---------------------------------------------------------------------------
@@ -244,8 +261,11 @@ export class AgentSdkBridge {
 
   async sendMessage(convId: string, text: string, attachments: BridgeAttachment[] = []): Promise<void> {
     const state = this.getSession(convId);
-    if (state.status !== 'idle' && state.status !== 'completed') {
-      throw new Error(`Cannot send message: agent is ${state.status}`);
+    // A5 修复：与 checkCanSend 共用同一判定，被拒绝的发送直接抛错
+    // （主进程在持久化 user message 前先调用 checkCanSend，因此被拒发送不会落库）。
+    const guard = canAcceptMessage(state.status);
+    if (!guard.ok) {
+      throw new Error(`Cannot send message: ${guard.error}`);
     }
 
     const abortController = new AbortController();
@@ -816,6 +836,15 @@ export class AgentSdkBridge {
 
   getStatus(convId: string): AgentStatus {
     return this.sessions.get(convId)?.status || 'idle';
+  }
+
+  /**
+   * A5 修复：原子确认 session 是否可接收新消息。
+   * 主进程在持久化 user message 之前调用；被拒绝时不写库、直接返回错误。
+   */
+  checkCanSend(convId: string): { ok: boolean; error?: string } {
+    const state = this.sessions.get(convId);
+    return canAcceptMessage(state?.status);
   }
 
   getSessionId(convId: string): string | null {

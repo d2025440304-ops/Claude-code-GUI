@@ -39,6 +39,8 @@ import { PtyManager } from './integration/pty-manager';
 import { ClaudePtyManager, ClaudePtyPermission } from './integration/claude-pty-manager';
 import { SessionWatcherManager, SessionEvent } from './integration/session-watcher';
 import { AgentSdkBridge } from './integration/agent-sdk-bridge';
+import { AgentTextAccumulator } from './integration/agent-text-accumulator';
+import { selectBranchMessages } from './db/branch-utils';
 import { scanSkills, SkillInfo } from './integration/skills-scanner';
 import type { PermissionDecision } from './types/agent';
 import { mapPermissionModeForPty } from './ipc/permission-modes';
@@ -447,6 +449,34 @@ function clearSessionState(conversationId: string): void {
   typingStarted.delete(conversationId);
 }
 
+/**
+ * C7 修复：message:send 已持久化但 CLI 进程尚未确认启动的 user message。
+ * convId -> 本次新建的 message id。CLI 启动失败（同步抛错或异步 error 事件）
+ * 时据此精确回滚；进程正常结束（close）后清除。'aborted'（用户主动停止，
+ * 消息已真正发出）不回滚。
+ */
+const pendingSendRollback = new Map<string, string>();
+
+/**
+ * C7 修复：删除某个 conversation 的待回滚 user message。
+ * 仅当该消息仍是会话最后一条时删除，绝不触碰已有历史。
+ */
+function rollbackPendingUserMessage(convId: string): void {
+  const messageId = pendingSendRollback.get(convId);
+  pendingSendRollback.delete(convId);
+  if (!messageId) return;
+  try {
+    const msgs = messageRepo.getByConversation(convId);
+    const last = msgs[msgs.length - 1];
+    if (!last || last.id !== messageId) return; // 已有后续内容（如并发回复），不回滚
+    messageRepo.delete(messageId);
+    const prev = msgs[msgs.length - 2];
+    conversationRepo.updateLastMessage(convId, prev ? prev.content.slice(0, 200) : '');
+  } catch (err) {
+    console.error('[Main] Failed to roll back pending user message:', err);
+  }
+}
+
 /** Flush every pending accumulator (used on quit). */
 function flushAllPending(): void {
   for (const id of Array.from(textAccumulators.keys())) {
@@ -456,15 +486,31 @@ function flushAllPending(): void {
     flushAssistantText(id);
   }
   // Flush any pending agent SDK messages
-  for (const convId of Array.from(agentTextAccum.keys())) {
+  const agentConvs = new Set<string>([
+    ...agentTextAccumulators.keys(),
+    ...agentContentBlocks.keys(),
+    ...agentAssistantMsgIds.keys(),
+  ]);
+  for (const convId of agentConvs) {
     flushAgentMessages(convId);
   }
 }
 
 // --- Agent SDK message persistence (module-level for before-quit access) ---
-const agentTextAccum = new Map<string, string>();
+/**
+ * P0 修复：以 SDK messageId 为粒度累计流式文本。
+ * text_delta 只更新该 messageId 的临时文本；最终 text 覆盖之（绝不追加），
+ * 从根本上消除"多个 delta + 最终 text"导致的落库重复。
+ */
+const agentTextAccumulators = new Map<string, AgentTextAccumulator>();
 const agentAssistantMsgIds = new Map<string, string>();
 const agentContentBlocks = new Map<string, unknown[]>();
+/**
+ * A5 修复：agent 发送后尚未产出任何回复的 user message（convId -> message id）。
+ * sendMessage 的大部分启动失败（如 SDK 加载失败）不会 reject，而是发出 error
+ * 事件；此时若该 user message 还没有任何回复产出，据此精确回滚。
+ */
+const pendingAgentUserMessages = new Map<string, string>();
 /** 持久化队列锁 — 防止并发事件导致数据丢失 */
 const agentPersistenceQueue = new Map<string, Promise<void>>();
 
@@ -485,7 +531,9 @@ function enqueueAgentPersistence(convId: string, fn: () => Promise<void>): void 
 }
 
 function flushAgentMessages(convId: string): void {
-  const text = agentTextAccum.get(convId);
+  // P0：flush 按 messageId 顺序拼接完整文本，并清空 per-message 临时状态
+  const acc = agentTextAccumulators.get(convId);
+  const text = acc ? acc.flush() : undefined;
   const blocks = agentContentBlocks.get(convId);
   const msgId = agentAssistantMsgIds.get(convId);
 
@@ -514,9 +562,27 @@ function flushAgentMessages(convId: string): void {
     console.error('[Main] Failed to persist agent messages:', err);
   }
 
-  agentTextAccum.delete(convId);
+  // flush 后清理本轮全部临时状态（含新增的 per-message 累计）
+  agentTextAccumulators.delete(convId);
   agentAssistantMsgIds.delete(convId);
   agentContentBlocks.delete(convId);
+}
+
+/**
+ * A5 修复：agent 发送被拒（启动失败）时精确回滚刚创建的 user message。
+ * 仅当该消息仍是会话最后一条时删除，不影响已有历史。
+ */
+function rollbackAgentUserMessage(convId: string, messageId: string): void {
+  try {
+    const msgs = messageRepo.getByConversation(convId);
+    const last = msgs[msgs.length - 1];
+    if (!last || last.id !== messageId) return; // 已有后续内容，不能回滚
+    messageRepo.delete(messageId);
+    const prev = msgs[msgs.length - 2];
+    conversationRepo.updateLastMessage(convId, prev ? prev.content.slice(0, 200) : '');
+  } catch (err) {
+    console.error('[Main] Failed to roll back agent user message:', err);
+  }
 }
 
 /**
@@ -577,6 +643,9 @@ function setupStreamListeners(): void {
   cliSpawner.on('close', ({ sessionId, exitCode }: CloseEvent) => {
     const conversationId = sessionId;
 
+    // C7 修复：进程正常结束（无论是否产出回复），不再需要回滚
+    pendingSendRollback.delete(conversationId);
+
     // Final flush of accumulated assistant text to the database.
     flushAssistantText(conversationId);
 
@@ -603,6 +672,14 @@ function setupStreamListeners(): void {
 
   cliSpawner.on('error', ({ sessionId, error }: CLIErrorEvent) => {
     const conversationId = sessionId;
+
+    // C7 修复：CLI 启动失败（未产出任何回复）→ 回滚本次 user message，不留下
+    // 孤儿消息。'aborted' 是用户主动停止/强杀，消息已真正发出，不回滚。
+    if (error.kind === 'aborted') {
+      pendingSendRollback.delete(conversationId);
+    } else {
+      rollbackPendingUserMessage(conversationId);
+    }
 
     // Persist whatever assistant text arrived before the error.
     flushAssistantText(conversationId);
@@ -713,6 +790,8 @@ function registerIpcHandlers(): void {
     (_e: IpcMainInvokeEvent, payload: ConversationIdPayload): { ok: boolean } => {
       // 清理全局状态，避免内存泄漏
       clearSessionState(payload.id);
+      pendingSendRollback.delete(payload.id);
+      pendingAgentUserMessages.delete(payload.id);
       // 同时清理 Claude PTY 会话
       claudePtyManager.kill(payload.id);
       // 停止 session watcher
@@ -768,21 +847,24 @@ function registerIpcHandlers(): void {
         const source = conversationRepo.getById(payload.sourceConvId);
         if (!source) return { ok: false, error: 'Source conversation not found' };
 
+        // A13 修复：messageId 必须是真实 SQLite message id（AGENT_SEND 返回的
+        // userMessage.id）。前端乐观 block id（user-xxx）找不到 → 返回 ok:false，
+        // 绝不创建空分支会话。
+        const allMessages = messageRepo.getByConversation(payload.sourceConvId);
+        const messagesToCopy = selectBranchMessages(allMessages, payload.messageId);
+        if (!messagesToCopy || messagesToCopy.length === 0) {
+          return { ok: false, error: 'Source message not found in this conversation.' };
+        }
+
         const title = payload.title || `${source.title} (branch)`;
         const newConv = conversationRepo.create(title, source.projectPath, source.model, source.kind);
-
-        const allMessages = messageRepo.getByConversation(payload.sourceConvId);
-        const targetIdx = allMessages.findIndex((m) => m.id === payload.messageId);
-        if (targetIdx >= 0) {
-          const messagesToCopy = allMessages.slice(0, targetIdx + 1);
-          for (const msg of messagesToCopy) {
-            messageRepo.create(newConv.id, msg.role, msg.content, msg.attachments);
-          }
-          conversationRepo.updateLastMessage(
-            newConv.id,
-            messagesToCopy[messagesToCopy.length - 1]?.content?.slice(0, 200) || '',
-          );
+        for (const msg of messagesToCopy) {
+          messageRepo.create(newConv.id, msg.role, msg.content, msg.attachments);
         }
+        conversationRepo.updateLastMessage(
+          newConv.id,
+          messagesToCopy[messagesToCopy.length - 1]?.content?.slice(0, 200) || '',
+        );
 
         broadcast(Channels.CONVERSATIONS_CHANGED);
         return { ok: true, conversation: newConv };
@@ -859,13 +941,21 @@ function registerIpcHandlers(): void {
       }
 
       // Persist the user message immediately (text + attachments).
+      // C7 修复：记录本次新建的 message id，CLI 启动失败时据此精确回滚，
+      // 绝不影响已有历史。
       let userMessage: Message;
       try {
         userMessage = messageRepo.create(conversationId, 'user', message, atts);
-        conversationRepo.updateLastMessage(conversationId, message || atts[0]?.name || '');
       } catch (err) {
         return { ok: false, error: `Failed to save message: ${(err as Error).message}` };
       }
+      try {
+        conversationRepo.updateLastMessage(conversationId, message || atts[0]?.name || '');
+      } catch (err) {
+        // 预览更新失败不阻塞发送；消息已入库
+        console.error('[Main] Failed to update conversation preview:', err);
+      }
+      pendingSendRollback.set(conversationId, userMessage.id);
 
       // Build the prompt: text + @path references for file attachments.
       // Image attachments are passed as base64 content blocks (stream-json).
@@ -906,6 +996,8 @@ function registerIpcHandlers(): void {
           thinkingEffort: thinkingEffort || undefined,
         });
       } catch (err) {
+        // C7 修复：spawn 同步失败 → 精确回滚本次新建的 user message
+        rollbackPendingUserMessage(conversationId);
         clearSessionState(conversationId);
         return {
           ok: false,
@@ -1414,17 +1506,29 @@ function registerIpcHandlers(): void {
   agentBridge.onEvent((convId, event) => {
     // --- Persistence logic (serialized via queue to prevent race conditions) ---
     enqueueAgentPersistence(convId, async () => {
+      // A5：任何回复产出事件都说明回复已开始 → 不再回滚 user message
+      if (
+        event.type === 'text' || event.type === 'text_delta' ||
+        event.type === 'thinking' || event.type === 'thinking_delta' ||
+        event.type === 'tool_use' || event.type === 'tool_result'
+      ) {
+        pendingAgentUserMessages.delete(convId);
+      }
+
       switch (event.type) {
         case 'text': {
-          // Full text block from assistant message
-          const prev = agentTextAccum.get(convId) || '';
-          agentTextAccum.set(convId, prev + (event as any).text);
+          // Full text block from assistant message — 用完整文本覆盖该 messageId
+          // 的临时文本（绝不追加），消除 delta + 最终 text 的落库重复。
+          const acc = agentTextAccumulators.get(convId) || new AgentTextAccumulator();
+          agentTextAccumulators.set(convId, acc);
+          acc.onFinalText((event as any).messageId, (event as any).text ?? '');
           break;
         }
         case 'text_delta': {
-          // Streaming delta — accumulate
-          const prev = agentTextAccum.get(convId) || '';
-          agentTextAccum.set(convId, prev + (event as any).delta);
+          // Streaming delta — 只更新该 messageId 的临时文本
+          const acc = agentTextAccumulators.get(convId) || new AgentTextAccumulator();
+          agentTextAccumulators.set(convId, acc);
+          acc.onDelta((event as any).messageId, (event as any).delta ?? '');
           break;
         }
         case 'tool_use': {
@@ -1459,8 +1563,19 @@ function registerIpcHandlers(): void {
         }
         case 'result': {
           // Turn complete — flush all accumulated messages
+          pendingAgentUserMessages.delete(convId);
           flushAgentMessages(convId);
           broadcast(Channels.CONVERSATIONS_CHANGED);
+          break;
+        }
+        case 'error': {
+          // A5 修复：发送后未产出任何回复就报错（启动失败）→ 精确回滚
+          // user message，不留幽灵消息。已有回复产出时 pending 已被清除。
+          const pendingId = pendingAgentUserMessages.get(convId);
+          if (pendingId) {
+            pendingAgentUserMessages.delete(convId);
+            rollbackAgentUserMessage(convId, pendingId);
+          }
           break;
         }
       }
@@ -1512,18 +1627,31 @@ function registerIpcHandlers(): void {
       model?: string;
       permissionMode?: string;
       thinkingEffort?: string;
-    }): Promise<{ ok: boolean }> => {
+    }): Promise<{ ok: boolean; error?: string; userMessage?: Message }> => {
      try {
+        // A5 修复：先原子确认 session 可接收消息，再持久化 user message。
+        // 快速连发时第二次发送在这里被拒绝，返回 { ok:false, error }，不写库。
+        const canSend = agentBridge.checkCanSend(payload.convId);
+        if (!canSend.ok) {
+          return { ok: false, error: canSend.error };
+        }
+
         // Flush any previous turn's partial data before starting a new turn,
         // so the accumulated assistant blocks are committed to DB cleanly.
         flushAgentMessages(payload.convId);
-        // Persist the user message to the database (text + attachments)
+
+        // Persist the user message to the database (text + attachments)。
+        // A13 修复：返回真实 SQLite message id，前端据此替换 optimistic block。
+        let userMessage: Message;
         try {
-          messageRepo.create(payload.convId, 'user', payload.text, payload.attachments || []);
+          userMessage = messageRepo.create(payload.convId, 'user', payload.text, payload.attachments || []);
           conversationRepo.updateLastMessage(payload.convId, payload.text || payload.attachments?.[0]?.name || '');
         } catch (err) {
           console.error('[Main] Failed to persist agent user message:', err);
+          return { ok: false, error: `Failed to save message: ${(err as Error).message}` };
         }
+        // A5：登记待确认启动的 user message（error 事件且无回复产出时回滚）
+        pendingAgentUserMessages.set(payload.convId, userMessage.id);
 
         // Update session options if provided (for mid-conversation changes)
         agentBridge.updateOptions(payload.convId, {
@@ -1533,13 +1661,16 @@ function registerIpcHandlers(): void {
         });
 
         // Fire-and-forget: sendMessage runs the whole turn asynchronously.
-        // Errors are caught and emitted to the renderer so the user sees them.
+        // 若发送在产出任何回复前被拒绝（如 SDK 加载失败），精确回滚刚创建的
+        // user message，保证被拒的发送不落库。
         agentBridge.sendMessage(payload.convId, payload.text, payload.attachments || []).catch((err) => {
           console.error('[Main] Agent sendMessage failed:', err);
+          pendingAgentUserMessages.delete(payload.convId);
+          rollbackAgentUserMessage(payload.convId, userMessage.id);
         });
-        return { ok: true };
+        return { ok: true, userMessage };
       } catch (err: unknown) {
-        return { ok: false };
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
       }
     },
   );
@@ -1547,6 +1678,8 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     Channels.AGENT_ABORT,
     async (_e: IpcMainInvokeEvent, payload: { convId: string }): Promise<{ ok: boolean }> => {
+      // A5：用户主动停止 → 消息已真正发出，不回滚
+      pendingAgentUserMessages.delete(payload.convId);
       await agentBridge.abort(payload.convId);
       return { ok: true };
     },
@@ -1577,6 +1710,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     Channels.AGENT_DESTROY,
     (_e: IpcMainInvokeEvent, payload: { convId: string }): { ok: boolean } => {
+      pendingAgentUserMessages.delete(payload.convId);
       agentBridge.destroySession(payload.convId);
       return { ok: true };
     },

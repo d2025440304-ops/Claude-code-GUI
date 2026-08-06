@@ -15,6 +15,7 @@ import { ipc, Channels } from './lib/ipc'
 import type { StreamChunk, StreamChunkPayload, StreamEndPayload, StreamErrorPayload } from './lib/ipc'
 import type { StreamState, StreamMachineEvent } from './lib/streamMachine'
 import { reduce as reduceStreamState, isStreamActive } from './lib/streamMachine'
+import { finalizeStreamingBlocks } from './lib/streamBlocks'
 import type { Conversation, Message, Attachment, HistoryConversation, HistoryConversationDetail, PermissionMode, ThinkingEffort, ModelOption, ContentBlock, DiffHunk } from './types'
 import { MODELS, PERMISSION_MODES, THINKING_EFFORTS } from './types'
 import { SkeletonConversationList } from './components/Skeleton'
@@ -313,6 +314,12 @@ export default function App() {
   const streamAbortRef = useRef<AbortController | null>(null)
   /** C4: STOP_REQUESTED 超时守卫 ref，防止 INTERRUPTING 永久锁死输入框 */
   const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /**
+   * C7 修复：记录本轮 message:send 的 optimistic user message。
+   * CLI 启动失败（stream:error，kind != aborted）时主进程已回滚 DB，
+   * 这里同步移除对应 UI 消息，不留幽灵消息。
+   */
+  const pendingUserMsgRef = useRef<{ convId: string; msgId: string } | null>(null)
   // Gracefully halt the active stream (New Chat / Stop / context switch).
   const abortActiveStream = useCallback(() => {
     if (!isStreamActive(streamStateRef.current)) return
@@ -447,6 +454,8 @@ export default function App() {
     setHistoryDetail(null)
     setLoadingMsgs(true)
     setError(null)
+    // C7：切换会话时清理 pending 登记，避免串会话
+    pendingUserMsgRef.current = null
     try {
       const res = await ipc.invoke<{ ok: boolean; messages?: Message[]; error?: string }>('message:list', { conversationId: id })
       if (res?.ok && res.messages) {
@@ -572,6 +581,17 @@ export default function App() {
       // C4: 清除 STOP_REQUESTED 超时守卫
       if (stopTimeoutRef.current) { clearTimeout(stopTimeoutRef.current); stopTimeoutRef.current = null }
       dispatchStream({ type: 'STOPPED' })
+      // C10 修复：正常结束 → 终结当前 assistant message 中所有 streaming block
+      // 为 completed（含无 tool_result 的 tool_use），杜绝永久 spinner。
+      setMessages((prev) => {
+        const last = prev[prev.length - 1]
+        if (last && last.role === 'assistant' && last.contentBlocks?.length) {
+          return [...prev.slice(0, -1), { ...last, contentBlocks: finalizeStreamingBlocks(last.contentBlocks, 'completed') }]
+        }
+        return prev
+      })
+      // C7：本轮发送已正常结束，清理乐观消息登记
+      if (pendingUserMsgRef.current?.convId === data.conversationId) pendingUserMsgRef.current = null
       loadConversationsRef.current()
     })
 
@@ -580,13 +600,32 @@ export default function App() {
       // C4: 清除 STOP_REQUESTED 超时守卫
       if (stopTimeoutRef.current) { clearTimeout(stopTimeoutRef.current); stopTimeoutRef.current = null }
       dispatchStream({ type: 'ERROR' })
-      setMessages((prev) => {
-        const last = prev[prev.length - 1]
-        if (last && last.role === 'assistant' && !last.content) {
-          return [...prev.slice(0, -1), { ...last, content: `Error: ${data.error}` }]
-        }
-        return [...prev, { id: crypto.randomUUID(), conversationId: data.conversationId, role: 'assistant' as const, content: `Error: ${data.error}`, timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }) }]
-      })
+
+      const pending = pendingUserMsgRef.current
+      // C7 修复：CLI 启动失败（kind != aborted，未产出任何回复）→ 主进程已回滚
+      // DB，这里同步移除 optimistic user message + 空 assistant 占位并展示错误。
+      // 'aborted'（用户主动停止）消息已真正发出，不移除。
+      const isStartupFailure = data.kind !== 'aborted' && !!pending && pending.convId === data.conversationId
+      if (isStartupFailure) {
+        pendingUserMsgRef.current = null
+        setError(data.error)
+        setMessages((prev) => {
+          const next = prev.filter((m) => m.id !== pending!.msgId)
+          const last = next[next.length - 1]
+          if (last && last.role === 'assistant' && !last.content && !last.contentBlocks?.length) return next.slice(0, -1)
+          return next
+        })
+      } else {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1]
+          if (last && last.role === 'assistant') {
+            // C10 修复：报错/中断 → 未完成 blocks 终结为 error（已完成内容不覆盖）
+            const blocks = last.contentBlocks?.length ? finalizeStreamingBlocks(last.contentBlocks, 'error') : undefined
+            return [...prev.slice(0, -1), { ...last, content: last.content ? last.content : `Error: ${data.error}`, contentBlocks: blocks }]
+          }
+          return [...prev, { id: crypto.randomUUID(), conversationId: data.conversationId, role: 'assistant' as const, content: `Error: ${data.error}`, timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }) }]
+        })
+      }
       // C3 修复：ERROR 状态 2 秒后自动恢复为 IDLE，用户可直接发送下一条消息
       // 无需手动切会话或重启。
       setTimeout(() => {
@@ -870,6 +909,9 @@ export default function App() {
       content: '',
       timestamp: now,
     }
+    // C7 修复：登记本轮 optimistic user message，启动失败时（同步 ok:false 或
+    // 异步 stream:error）据此精确移除，不留 UI 幽灵消息。
+    pendingUserMsgRef.current = { convId: activeConvId, msgId: userMsg.id }
     setMessages((prev) => [...prev, userMsg, assistantMsg])
     streamAbortRef.current?.abort()
     const ac = new AbortController()
@@ -888,23 +930,31 @@ export default function App() {
       if (!res?.ok) {
         dispatchStream({ type: 'STOPPED' })
         setError(res?.error || 'Failed to send message')
-        setMessages((prev) => {
-          const last = prev[prev.length - 1]
-          if (last && last.role === 'assistant' && !last.content) return prev.slice(0, -1)
-          return prev
-        })
+        // C7 修复：同步失败 → 移除本轮 optimistic user message + 空 assistant 占位
+        // （主进程已回滚 DB，UI 必须同步）
+        removePendingSendMessages(userMsg.id)
       }
     } catch (e) {
       if (ac.signal.aborted) return
       console.error('Failed to send message:', e)
       dispatchStream({ type: 'STOPPED' })
       setError('Failed to send message. Please try again.')
-      setMessages((prev) => {
-        const last = prev[prev.length - 1]
-        if (last && last.role === 'assistant' && !last.content) return prev.slice(0, -1)
-        return prev
-      })
+      removePendingSendMessages(userMsg.id)
     }
+  }
+
+  /**
+   * C7 修复：发送失败时移除本轮 optimistic user message（按真实 id 精确匹配）
+   * 以及紧随其后的空 assistant 占位，与主进程的 DB 回滚保持一致。
+   */
+  const removePendingSendMessages = (userMsgId: string) => {
+    pendingUserMsgRef.current = null
+    setMessages((prev) => {
+      const next = prev.filter((m) => m.id !== userMsgId)
+      const last = next[next.length - 1]
+      if (last && last.role === 'assistant' && !last.content && !last.contentBlocks?.length) return next.slice(0, -1)
+      return next
+    })
   }
 
   /* ---- 权限拒绝后一键批准重发 ---- */

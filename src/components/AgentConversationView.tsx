@@ -63,12 +63,15 @@ interface AgentConversationViewProps {
  *
  * Assistant messages are stored as a JSON array of structured parts
  * (text / thinking / tool_use / tool_result). User messages are plain text.
+ *
+ * A13 修复：user block 直接使用真实 SQLite message id（msg.id），
+ * 这样从恢复的历史上 Branch 时传的就是真实 UUID，而不是 r-u-N 占位 id。
  */
-function restoreBlocksFromMessages(messages: Array<{ role: string; content: string }>): AgentMessageBlock[] {
+function restoreBlocksFromMessages(messages: Array<{ id: string; role: string; content: string }>): AgentMessageBlock[] {
   const blocks: AgentMessageBlock[] = [];
   for (const msg of messages) {
     if (msg.role === 'user') {
-      blocks.push({ id: `r-u-${blocks.length}`, type: 'user_text', content: msg.content });
+      blocks.push({ id: msg.id || `r-u-${blocks.length}`, type: 'user_text', content: msg.content });
       continue;
     }
     // Assistant: try JSON array of parts, fall back to plain text.
@@ -168,6 +171,18 @@ export default function AgentConversationView({
   const sentinelRef = useRef<HTMLDivElement>(null);
   const [visibleCount, setVisibleCount] = useState(50);
   blocksRef.current = blocks;
+  /**
+   * A5 修复：登记"已发送但尚未产出任何回复"的乐观 user block。
+   * 收到任何回复内容事件即清除；收到 error 事件且仍登记中 → 主进程已回滚 DB，
+   * 这里同步移除对应 block，不留 UI 幽灵消息。
+   */
+  const pendingOptimisticRef = useRef<{ convId: string; blockId: string } | null>(null);
+  /**
+   * A13 修复：乐观 block id -> 真实 SQLite message id 映射。
+   * Block 的 id 保持乐观值（渲染键稳定、失败移除简单），Branch 时经此映射
+   * 解析为真实 message UUID 再传给后端。
+   */
+  const blockIdMapRef = useRef<Record<string, string>>({});
 
   // Virtual scrolling: only render last N blocks
   const visibleBlocks = blocks.slice(-visibleCount);
@@ -234,7 +249,9 @@ export default function AgentConversationView({
       // If the session is idle, restore everything from DB.
       const isActive = createRes.sessionStatus !== 'idle' && createRes.sessionStatus !== 'completed';
       try {
-        const msgRes = await ipc.invoke<{ ok: boolean; messages?: Array<{ role: string; content: string }> }>('message:list', { conversationId });
+        // A13 修复：message:list 返回的 Message 带真实 id，恢复的 user block
+        // 直接用该 id，Branch 时传给后端的就是真实 SQLite message UUID。
+        const msgRes = await ipc.invoke<{ ok: boolean; messages?: Array<{ id: string; role: string; content: string }> }>('message:list', { conversationId });
         if (msgRes?.ok && msgRes.messages) {
           const restored = restoreBlocksFromMessages(msgRes.messages);
           if (isActive) {
@@ -304,6 +321,11 @@ export default function AgentConversationView({
   // Handle incoming agent events
   const handleAgentEvent = useCallback((event: AgentEvent) => {
     const currentBlocks = blocksRef.current;
+
+    // A5：任何回复内容事件 → 回复已开始，乐观 user block 不再可能被回滚
+    if (['text', 'text_delta', 'thinking', 'thinking_delta', 'tool_use', 'tool_result'].includes(event.type)) {
+      pendingOptimisticRef.current = null;
+    }
 
     switch (event.type) {
       case 'init': {
@@ -493,6 +515,8 @@ export default function AgentConversationView({
       case 'result': {
         // Turn completed
         setBlocks(prev => prev.map(b => b.isStreaming ? { ...b, isStreaming: false } : b));
+        // A5：回合结束，乐观 block 不再需要回滚
+        pendingOptimisticRef.current = null;
         // 记录用量（/cost 与回合结束展示）
         const res = event as any;
         if (typeof res.costUsd === 'number') {
@@ -507,6 +531,13 @@ export default function AgentConversationView({
       }
 
       case 'error': {
+        // A5 修复：发送后未产出任何回复就报错（启动失败）→ 主进程已回滚 DB，
+        // 这里同步移除对应乐观 user block，不留 UI 幽灵消息。
+        const pending = pendingOptimisticRef.current;
+        if (pending) {
+          pendingOptimisticRef.current = null;
+          setBlocks(prev => prev.filter(b => b.id !== pending.blockId));
+        }
         setError((event as any).message);
         setStatus('error');
         break;
@@ -532,12 +563,22 @@ export default function AgentConversationView({
   }, [onSessionIdChange, scrollToBottom]);
 
   // Send message
+  // A5 修复：本地发送锁 — 覆盖 status 事件尚未回到 renderer 的窗口，
+  // 防止快速连发；响应返回（终态确认）或失败后释放。
+  const sendInFlightRef = useRef(false);
+
   const handleSend = useCallback(async (text: string, attachments?: Attachment[]) => {
     setError(null);
 
-    // Add user message to blocks
+    // A5 本地发送锁：上一条 AGENT_SEND 未返回前不允许再发
+    if (sendInFlightRef.current) return;
+    sendInFlightRef.current = true;
+
+    // 乐观 user block（A13：收到响应后用真实 SQLite message id 替换，Branch 可用）
+    const optimisticId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    pendingOptimisticRef.current = { convId: conversationId, blockId: optimisticId };
     setBlocks(prev => [...prev, {
-      id: 'user-' + Date.now(),
+      id: optimisticId,
       type: 'user_text',
       content: text,
       attachments: attachments || [],
@@ -545,7 +586,7 @@ export default function AgentConversationView({
     scrollToBottom();
 
     try {
-      await ipc.invoke(Channels.AGENT_SEND, {
+      const res = await ipc.invoke<{ ok: boolean; error?: string; userMessage?: { id: string } }>(Channels.AGENT_SEND, {
         convId: conversationId,
         text,
         attachments: attachments || [],
@@ -553,8 +594,24 @@ export default function AgentConversationView({
         permissionMode,
         thinkingEffort,
       });
+      if (!res?.ok) {
+        setError(res?.error || 'Failed to send message');
+        // 被拒的发送不落库 → 移除对应 optimistic user block，不留 UI 幽灵消息
+        if (pendingOptimisticRef.current?.blockId === optimisticId) pendingOptimisticRef.current = null;
+        setBlocks(prev => prev.filter(b => b.id !== optimisticId));
+        return;
+      }
+      // A13：记录乐观 block id -> 真实 SQLite message id 映射（Branch 时解析用），
+      // block id 本身保持不变，避免与 A5 的失败移除产生 id 竞态。
+      if (res.userMessage?.id) {
+        blockIdMapRef.current[optimisticId] = res.userMessage.id;
+      }
     } catch (err) {
       setError(`Failed to send message: ${err}`);
+      if (pendingOptimisticRef.current?.blockId === optimisticId) pendingOptimisticRef.current = null;
+      setBlocks(prev => prev.filter(b => b.id !== optimisticId));
+    } finally {
+      sendInFlightRef.current = false;
     }
   }, [conversationId, model, permissionMode, thinkingEffort, scrollToBottom]);
 
@@ -613,17 +670,26 @@ export default function AgentConversationView({
   }, [conversationId, popPermission]);
 
   // Branch conversation from a specific user message
-  const handleBranch = useCallback(async (messageId: string) => {
+  const handleBranch = useCallback(async (blockId: string) => {
     try {
+      // A13 修复：把 block id（乐观 id 或恢复历史的真实 id）解析为 SQLite
+      // message UUID —— 只有真实 UUID 才能在后端命中 source message。
+      const dbMessageId = blockIdMapRef.current[blockId] || blockId;
       const res = await ipc.invoke<{ ok: boolean; conversation?: Conversation; error?: string }>(
         Channels.CONVERSATION_BRANCH,
-        { sourceConvId: conversationId, messageId }
+        { sourceConvId: conversationId, messageId: dbMessageId }
       );
       if (res?.ok && res.conversation) {
         window.dispatchEvent(new CustomEvent('ccd:switch-conv', { detail: { convId: res.conversation.id } }));
+      } else {
+        // A13 修复：找不到源消息（如未替换成真实 id 的乐观 block）→ 展示错误，
+        // 不再静默失败
+        console.error('Failed to branch:', res?.error);
+        setError(res?.error || 'Failed to branch conversation');
       }
     } catch (err) {
       console.error('Failed to branch:', err);
+      setError(`Failed to branch: ${err}`);
     }
   }, [conversationId]);
 
