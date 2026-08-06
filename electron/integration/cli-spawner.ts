@@ -201,7 +201,7 @@ export class CliSpawner extends EventEmitter {
       });
       try {
         child.stdin?.end(payload, 'utf8');
-      } catch (err) {
+      } catch {
         // If stdin is already closed (e.g. early exit), ignore.
       }
     }

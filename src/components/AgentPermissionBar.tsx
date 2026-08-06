@@ -28,9 +28,9 @@ interface AgentPermissionBarProps {
 // Tool metadata — icon, color, human label
 // ---------------------------------------------------------------------------
 
-const IconComponent: typeof Shield = Shield; // just for typeof usage
+const _IconComponent: typeof Shield = Shield; // just for typeof usage
 
-const TOOL_META: Record<string, { icon: typeof IconComponent; color: string; label: string }> = {
+const TOOL_META: Record<string, { icon: typeof _IconComponent; color: string; label: string }> = {
   Bash:          { icon: Terminal,  color: 'var(--warn)',          label: 'Shell Command' },
   Edit:          { icon: FileCode,  color: 'var(--accent-primary)', label: 'Edit File' },
   Write:         { icon: FileText,  color: 'var(--success)',       label: 'Write File' },

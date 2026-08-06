@@ -9,7 +9,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import {
   Terminal, FileEdit, FilePlus, FileText, FolderSearch, GitBranch,
   ChevronDown, ChevronRight, AlertCircle, CheckCircle2, Brain,
-  MessageSquare, Loader2, Wrench, Eye, EyeOff, Circle
+  MessageSquare, Loader2, Wrench, Eye, EyeOff
 } from 'lucide-react'
 import { ipc, Channels } from '../lib/ipc';
 

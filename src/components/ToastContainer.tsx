@@ -2,7 +2,6 @@
  * Toast 通知容器 — 渲染全局错误/通知队列。
  * 固定在右下角，自动消失，可手动关闭。
  */
-import { useEffect } from 'react'
 import { useToastStore, type Toast } from '../stores/toastStore'
 import { X, AlertTriangle, CheckCircle, Info, AlertCircle } from 'lucide-react'
 

@@ -53,7 +53,7 @@ export function scanSkills(projectPaths: string[]): SkillInfo[] {
       const skillDir = path.join(root, entry.name);
       const mdPath = path.join(skillDir, 'SKILL.md');
       if (!existsSync(mdPath)) continue;
-      let content = '';
+      let content: string;
       try {
         content = readFileSync(mdPath, 'utf-8');
       } catch {

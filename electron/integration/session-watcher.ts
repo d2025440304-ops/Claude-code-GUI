@@ -418,7 +418,6 @@ export class SessionWatcher {
         // tool_result 的 content 可能是字符串或数组
         const resultContent = b.content;
         let stdout: string | undefined;
-        let stderr: string | undefined;
         let diff: DiffHunk[] | undefined;
         let filePath: string | undefined;
 
@@ -452,7 +451,6 @@ export class SessionWatcher {
           timestamp,
           toolUseId,
           stdout,
-          stderr,
           diff,
           filePath,
           isError: isErr,

@@ -6,7 +6,7 @@
  * 中间：可拖拽分隔条
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Folder, FolderOpen, File, FileCode, FileText, FileJson, Image, Loader2, ChevronRight, RefreshCw, BookOpen } from 'lucide-react'
+import { Folder, File, FileCode, FileText, FileJson, Image, Loader2, ChevronRight, BookOpen } from 'lucide-react'
 import { ipc, Channels } from '../lib/ipc';
 import { MarkdownContent } from '../lib/codeRenderer';
 

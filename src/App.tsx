@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Plus, Search, Pin, FolderOpen, Settings, ChevronDown, Sparkles, Edit3, Loader2, Trash2, X, MessageSquare, Hash, Sun, Moon, PanelLeft, ExternalLink, History, Terminal, Globe, PanelRight, MessageCircle, Key, Eye, EyeOff, Check, Shield, FileCode } from 'lucide-react'
+import { Plus, Search, Pin, FolderOpen, Settings, ChevronDown, Sparkles, Edit3, Loader2, Trash2, X, MessageSquare, Hash, Sun, Moon, PanelLeft, ExternalLink, History, Terminal, Globe, PanelRight, MessageCircle, Key, Eye, EyeOff, Check, FileCode } from 'lucide-react'
 import ChatView from './components/ChatView'
 import AgentConversationView from './components/AgentConversationView'
 import ImportedChatView from './components/ImportedChatView'
@@ -10,178 +10,16 @@ import ProjectSelector from './components/ProjectSelector'
 import ConfirmDialog from './components/ConfirmDialog'
 import ErrorBoundary from './components/ErrorBoundary'
 import ToastContainer from './components/ToastContainer'
-import { useToastStore } from './stores/toastStore'
-import { ipc, Channels } from './lib/ipc'
-import type { StreamChunk, StreamChunkPayload, StreamEndPayload, StreamErrorPayload } from './lib/ipc'
+import { ipc } from './lib/ipc'
+import type { StreamChunkPayload, StreamEndPayload, StreamErrorPayload } from './lib/ipc'
 import type { StreamState, StreamMachineEvent } from './lib/streamMachine'
 import { reduce as reduceStreamState, isStreamActive } from './lib/streamMachine'
-import { finalizeStreamingBlocks } from './lib/streamBlocks'
-import type { Conversation, Message, Attachment, HistoryConversation, HistoryConversationDetail, PermissionMode, ThinkingEffort, ModelOption, ContentBlock, DiffHunk } from './types'
+import { applyChunkToBlocks, finalizeStreamingBlocks } from './lib/streamBlocks'
+import { deserializeMessageBlocks, getProjectName, plainifyJSONContent } from './lib/message-utils'
+import type { Conversation, Message, Attachment, HistoryConversation, HistoryConversationDetail, PermissionMode, ThinkingEffort, ModelOption } from './types'
 import { MODELS, PERMISSION_MODES, THINKING_EFFORTS } from './types'
 import { SkeletonConversationList } from './components/Skeleton'
 
-/* ---------- helpers ---------- */
-
-function getProjectName(path: string | null): string | null {
-  if (!path) return null
-  const parts = path.split('/')
-  return parts[parts.length - 1] || path
-}
-
-/** 安全解析 JSON，失败返回 undefined */
-function safeParseJSON(s?: string): Record<string, unknown> | undefined {
-  if (!s) return undefined
-  try { return JSON.parse(s) as Record<string, unknown> } catch { return undefined }
-}
-
-/**
- * 将流式 chunk 应用到 assistant message 的 contentBlocks 数组。
- *
- * 规则：
- * - text/thinking：blockStart=true 时新建 block；否则追加到最后一个同类型 streaming block
- * - tool_use：blockStart=true 新建（只有 toolName+toolUseId）；后续带 input 的更新同 toolUseId 的 block
- * - tool_result：按 toolUseId 关联到对应 tool_use block，填入 stdout/diff/isError
- * - permission_denial：直接新建
- */
-function applyChunkToBlocks(blocks: ContentBlock[], chunk: StreamChunk): ContentBlock[] {
-  const next = [...blocks]
-
-  switch (chunk.type) {
-    case 'text': {
-      if (chunk.blockStart || next.length === 0 || next[next.length - 1].type !== 'text' || next[next.length - 1].status !== 'streaming') {
-        next.push({ id: crypto.randomUUID(), type: 'text', content: chunk.content || '', status: 'streaming' })
-      } else {
-        const last = next[next.length - 1]
-        next[next.length - 1] = { ...last, content: (last.content || '') + (chunk.content || '') }
-      }
-      break
-    }
-    case 'thinking': {
-      if (chunk.blockStart || next.length === 0 || next[next.length - 1].type !== 'thinking' || next[next.length - 1].status !== 'streaming') {
-        next.push({ id: crypto.randomUUID(), type: 'thinking', content: chunk.content || '', status: 'streaming' })
-      } else {
-        const last = next[next.length - 1]
-        next[next.length - 1] = { ...last, content: (last.content || '') + (chunk.content || '') }
-      }
-      break
-    }
-    case 'tool_use': {
-      // 带 input：更新已存在的 block（content_block_stop 触发）
-      if (chunk.input && chunk.toolUseId) {
-        const idx = next.findIndex(b => b.toolUseId === chunk.toolUseId)
-        if (idx >= 0) {
-          next[idx] = { ...next[idx], toolName: chunk.tool || next[idx].toolName, toolInput: safeParseJSON(chunk.input), status: 'completed' }
-        } else {
-          next.push({ id: crypto.randomUUID(), type: 'tool_use', toolName: chunk.tool, toolUseId: chunk.toolUseId, toolInput: safeParseJSON(chunk.input), status: 'completed' })
-        }
-      } else if (chunk.toolUseId) {
-        // content_block_start：新建 streaming tool_use block
-        next.push({ id: crypto.randomUUID(), type: 'tool_use', toolName: chunk.tool, toolUseId: chunk.toolUseId, status: 'streaming' })
-      }
-      break
-    }
-    case 'tool_result': {
-      if (chunk.toolUseId) {
-        const idx = next.findIndex(b => b.toolUseId === chunk.toolUseId)
-        const resultPatch: Partial<ContentBlock> = {
-          stdout: chunk.stdout,
-          stderr: chunk.stderr,
-          diff: chunk.diff,
-          filePath: chunk.filePath,
-          isError: chunk.isError,
-          content: chunk.content,
-          status: chunk.isError ? 'error' : 'completed',
-        }
-        if (idx >= 0) {
-          next[idx] = { ...next[idx], ...resultPatch }
-        } else {
-          next.push({ id: crypto.randomUUID(), type: 'tool_result', toolUseId: chunk.toolUseId, ...resultPatch } as ContentBlock)
-        }
-      }
-      break
-    }
-    case 'permission_denial': {
-      next.push({
-        id: crypto.randomUUID(),
-        type: 'permission_denial',
-        toolName: chunk.tool,
-        toolInput: safeParseJSON(chunk.input),
-        content: chunk.content,
-        status: 'error',
-      })
-      break
-    }
-  }
-
-  return next
-}
-
-/**
- * 如果 content 是 JSON 数组（结构化 parts），提取其中 text 部分拼接为纯文本。
- * 用于 HistoryMessage 等不需要 contentBlocks 的场景。
- */
-function plainifyJSONContent<T extends { role: string; content: string }>(msg: T): T {
-  if (msg.role !== 'assistant' || !msg.content) return msg
-  try {
-    const v = JSON.parse(msg.content)
-    if (Array.isArray(v) && v.length > 0 && v[0] && typeof v[0] === 'object' && 'type' in v[0]) {
-      const text = v.filter((p: Record<string, unknown>) => p.type === 'text' && p.text).map((p: Record<string, unknown>) => p.text as string).join('')
-      if (text) return { ...msg, content: text }
-    }
-  } catch {}
-  return msg
-}
-
-/**
- * Parse assistant messages whose `content` field contains a JSON-serialized
- * array of structured parts (text / thinking / tool_use / tool_result) back
- * into `contentBlocks` so that ChatView can render them with proper formatting
- * (markdown, code highlighting, tool cards) instead of raw JSON.
- */
-function deserializeMessageBlocks(msg: Message): Message {
-  if (msg.role !== 'assistant' || !msg.content || msg.contentBlocks?.length) return msg
-  let parsed: Array<Record<string, unknown>> | null = null
-  try {
-    const v = JSON.parse(msg.content)
-    if (Array.isArray(v) && v.length > 0 && v[0] && typeof v[0] === 'object' && 'type' in v[0]) parsed = v
-  } catch { return msg }
-  if (!parsed) return msg
-  const blocks: ContentBlock[] = []
-  let i = 0
-  for (const p of parsed) {
-    const t = p.type as string
-    if (t === 'text' && p.text) {
-      blocks.push({ id: `db-${i}`, type: 'text', content: p.text as string, status: 'completed' })
-    } else if (t === 'thinking' && p.text) {
-      blocks.push({ id: `db-${i}`, type: 'thinking', content: p.text as string, status: 'completed' })
-    } else if (t === 'tool_use') {
-      blocks.push({
-        id: `db-${i}`, type: 'tool_use', toolName: p.toolName as string,
-        toolUseId: p.toolUseId as string, toolInput: p.input as Record<string, unknown> | undefined,
-        status: 'completed',
-      })
-    } else if (t === 'tool_result') {
-      const idx = blocks.findIndex(b => b.toolUseId === p.toolUseId && b.type === 'tool_use')
-      const result = {
-        content: p.content as string | undefined,
-        stdout: p.stdout as string | undefined,
-        stderr: p.stderr as string | undefined,
-        isError: !!p.isError,
-        diff: p.diff as DiffHunk[] | undefined,
-        filePath: p.filePath as string | undefined,
-      }
-      if (idx >= 0) {
-        blocks[idx] = { ...blocks[idx], ...result, status: (p.isError ? 'error' : 'completed') }
-      } else {
-        blocks.push({ id: `db-${i}`, type: 'tool_result', toolUseId: p.toolUseId as string, ...result, status: 'completed' })
-      }
-    }
-    i++
-  }
-  // Derive a plain-text content from blocks for fallback / preview.
-  const textContent = blocks.filter(b => b.type === 'text').map(b => b.content || '').join('')
-  return { ...msg, contentBlocks: blocks, content: textContent || msg.content }
-}
 
 /* ---------- App ---------- */
 
@@ -692,27 +530,6 @@ export default function App() {
     }
   }
 
-  /* ---- quick chat (no project folder) ---- */
-  const handleQuickChat = async () => {
-    abortActiveStream()
-    try {
-      const conv = await ipc.invoke<Conversation>('conversation:create', {
-        title: 'New Chat',
-        projectPath: null,
-        model: selectedModel,
-        kind: viewMode,
-      })
-      setConversations((prev) => [conv, ...prev])
-      setActiveConvId(conv.id)
-      setNewChatProjectPath(null)
-      setMessages([])
-      setError(null)
-    } catch (e) {
-      console.error('Failed to create quick chat:', e)
-      setError('Failed to create conversation')
-    }
-  }
-
   /* ---- global keyboard shortcuts ---- */
   const newChatRef = useRef(() => {})
   newChatRef.current = handleNewChat
@@ -1021,7 +838,7 @@ export default function App() {
           return prev
         })
       }
-    } catch (e) {
+    } catch {
       if (ac.signal.aborted) return
       dispatchStream({ type: 'STOPPED' })
       setError('Failed to resend message')

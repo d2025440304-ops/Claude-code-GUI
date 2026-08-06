@@ -13,7 +13,6 @@
  * Electron main process runs as CommonJS, we lazy-load it via dynamic import().
  */
 import type { SDKMessage, PermissionResult, Query as SDKQuery, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
-import type { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
 import path from 'path';
 import { resolveCwd } from './resolve-cwd';
@@ -23,7 +22,6 @@ import type {
   AgentEvent,
   PermissionDecision,
   FileChangeRecord,
-  AgentBridgeSession,
 } from '../types/agent';
 
 /** Attachment shape received from the renderer via main. */
@@ -188,6 +186,77 @@ export function canAcceptMessage(
     return { ok: false, error: `Agent is busy (${status}). Please wait for the current turn to finish.` };
   }
   return { ok: true };
+}
+
+/** tool_use 块关联元数据（供 tool_result 事件补全工具名/文件路径）。 */
+export interface ToolMeta {
+  toolUseId: string;
+  toolName: string;
+  filePath?: string;
+}
+
+/**
+ * 纯函数：把 SDK assistant message 的 content blocks 翻译成 AgentEvent 列表。
+ * 之前这段逻辑埋在 bridge 私有方法里无法单测，现抽出为纯函数。
+ * 未知 block 类型被忽略（与旧行为一致）。
+ */
+export function translateAssistantBlocks(
+  messageId: string,
+  sessionId: string,
+  timestamp: number,
+  content: Array<Record<string, unknown>>,
+): Array<{ event: AgentEvent; toolMeta?: ToolMeta }> {
+  const out: Array<{ event: AgentEvent; toolMeta?: ToolMeta }> = [];
+  for (const block of content) {
+    switch (block.type) {
+      case 'text':
+        out.push({
+          event: { type: 'text', sessionId, timestamp, text: block.text as string, messageId },
+        });
+        break;
+      case 'thinking':
+        out.push({
+          event: { type: 'thinking', sessionId, timestamp, text: block.thinking as string, messageId },
+        });
+        break;
+      case 'tool_use': {
+        const toolName = block.name as string;
+        const toolUseId = block.id as string;
+        const input = (block.input || {}) as Record<string, unknown>;
+        const toolFilePath = (input.file_path || input.filePath || '') as string;
+        out.push({
+          event: {
+            type: 'tool_use',
+            sessionId,
+            timestamp,
+            toolName,
+            toolUseId,
+            input,
+            messageId,
+          },
+          toolMeta: { toolUseId, toolName, ...(toolFilePath ? { filePath: toolFilePath } : {}) },
+        });
+        break;
+      }
+      default:
+        // 未知 block 类型（如 tool_result 在 assistant 消息里）忽略
+        break;
+    }
+  }
+  return out;
+}
+
+/** 纯函数：tool_result 的 content 归一化为字符串（字符串原样 / 数组拼接 / 其他序列化）。 */
+export function normalizeToolResultContent(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => (typeof c === 'string' ? c : (c as { text?: string })?.text || ''))
+      .join('\n');
+  }
+  return JSON.stringify(content ?? '');
 }
 
 // ---------------------------------------------------------------------------
@@ -417,54 +486,22 @@ export class AgentSdkBridge {
     const content = msg.message?.content;
     if (!Array.isArray(content)) return;
 
-    for (const block of content) {
-      switch (block.type) {
-        case 'text':
-          this.emit(convId, {
-            type: 'text',
-            sessionId: state.sessionId || '',
-            timestamp: Date.now(),
-            text: block.text,
-            messageId,
-          });
-          break;
-
-        case 'thinking':
-          this.emit(convId, {
-            type: 'thinking',
-            sessionId: state.sessionId || '',
-            timestamp: Date.now(),
-            text: block.thinking,
-            messageId,
-          });
-          break;
-
-        case 'tool_use': {
-          const toolName = block.name;
-          const toolUseId = block.id;
-          const input = (block.input || {}) as Record<string, unknown>;
-
-          this.emit(convId, {
-            type: 'tool_use',
-            sessionId: state.sessionId || '',
-            timestamp: Date.now(),
-            toolName,
-            toolUseId,
-            input,
-            messageId,
-          });
-
-          // Track metadata for correlating the eventual tool_result event.
-          const toolFilePath = (input.file_path || input.filePath || '') as string;
-          state.toolUseMeta.set(toolUseId, {
-            toolName,
-            ...(toolFilePath ? { filePath: toolFilePath } : {}),
-          });
-          break;
-        }
-     }
-   }
- }
+    // 翻译逻辑抽为纯函数 translateAssistantBlocks（可单测）
+    const timestamp = Date.now();
+    const sessionId = state.sessionId || '';
+    for (const { event, toolMeta } of translateAssistantBlocks(
+      messageId,
+      sessionId,
+      timestamp,
+      content as unknown as Array<Record<string, unknown>>,
+    )) {
+      this.emit(convId, event);
+      // Track metadata for correlating the eventual tool_result event.
+      if (toolMeta) {
+        state.toolUseMeta.set(toolMeta.toolUseId, toolMeta);
+      }
+    }
+  }
 
   /**
    * Handle SDK 'user' messages. These carry tool_result content blocks that
@@ -486,17 +523,8 @@ export class AgentSdkBridge {
       if (b.type !== 'tool_result' || !b.tool_use_id) continue;
 
       const meta = state.toolUseMeta.get(b.tool_use_id);
-      // Normalize content to a string for the renderer.
-      let resultContent: string;
-      if (typeof b.content === 'string') {
-        resultContent = b.content;
-      } else if (Array.isArray(b.content)) {
-        resultContent = b.content
-          .map((c) => (typeof c === 'string' ? c : (c as { text?: string })?.text || ''))
-          .join('\n');
-      } else {
-        resultContent = JSON.stringify(b.content ?? '');
-      }
+      // Normalize content to a string for the renderer (纯函数，可单测).
+      const resultContent = normalizeToolResultContent(b.content);
 
       this.emit(convId, {
         type: 'tool_result',

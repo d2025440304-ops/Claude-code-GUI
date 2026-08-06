@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
-  Send, Square, ArrowUp, HelpCircle, FileCode, Zap, Paperclip, ImagePlus,
+  Square, ArrowUp, HelpCircle, FileCode, Zap, Paperclip, ImagePlus,
 } from 'lucide-react';
 import ControlBar from './ControlBar';
 import type { ModelOption, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption, Attachment } from '../types';

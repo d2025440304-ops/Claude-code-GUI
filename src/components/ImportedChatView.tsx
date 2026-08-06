@@ -7,7 +7,7 @@
 import { useRef, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { User, Sparkles, Clock, Cpu, MessageSquarePlus } from 'lucide-react'
+import { Sparkles, Clock, Cpu, MessageSquarePlus } from 'lucide-react'
 
 interface HistoryMessage {
   uuid: string
@@ -50,7 +50,7 @@ function formatTokens(n: number): string {
   return String(n)
 }
 
-export default function ImportedChatView({ messages, title, projectPath, entrypoint, onContinue }: ImportedChatViewProps) {
+export default function ImportedChatView({ messages, title: _title, projectPath: _projectPath, entrypoint, onContinue }: ImportedChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
 
   // 自动滚动到底部

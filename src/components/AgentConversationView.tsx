@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Loader2, Brain, Wrench, Shield, AlertCircle, RotateCcw, GitBranch } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Loader2, Brain, Wrench, Shield, AlertCircle, RotateCcw } from 'lucide-react';
 import { ipc, Channels } from '../lib/ipc';
 import type { Conversation, Attachment } from '../types';
 import type { ModelOption, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption } from '../types';
@@ -150,7 +150,7 @@ export default function AgentConversationView({
   const [blocks, setBlocks] = useState<AgentMessageBlock[]>([]);
   // A4 修复：权限请求改为队列管理 — 并发多个权限请求时逐个展示，
   // 响应一个再显示下一个，避免后续请求无 UI 处理导致 agent 挂起。
-  const [permissionQueue, setPermissionQueue] = useState<PermissionRequestData[]>([]);
+  const [, setPermissionQueue] = useState<PermissionRequestData[]>([]);
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequestData | null>(null);
   const permissionRequestRef = useRef<PermissionRequestData | null>(null);
   permissionRequestRef.current = permissionRequest;
@@ -163,7 +163,7 @@ export default function AgentConversationView({
   const [showUsage, setShowUsage] = useState(false);
   // 会话真实可用的 skills（SDK supportedCommands 推送）
   const [availableSkills, setAvailableSkills] = useState<{ name: string; description: string }[]>([]);
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [, setSessionId] = useState<string | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -320,7 +320,6 @@ export default function AgentConversationView({
 
   // Handle incoming agent events
   const handleAgentEvent = useCallback((event: AgentEvent) => {
-    const currentBlocks = blocksRef.current;
 
     // A5：任何回复内容事件 → 回复已开始，乐观 user block 不再可能被回滚
     if (['text', 'text_delta', 'thinking', 'thinking_delta', 'tool_use', 'tool_result'].includes(event.type)) {

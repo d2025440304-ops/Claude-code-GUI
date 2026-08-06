@@ -18,7 +18,7 @@ import { app, BrowserWindow, ipcMain, dialog, IpcMainInvokeEvent, clipboard } fr
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { execSync, exec } from 'child_process';
+import { execSync } from 'child_process';
 
 import { Channels } from './ipc/channels';
 import { detectClaudeCli, CliInfo } from './integration/cli-detector';
@@ -39,7 +39,7 @@ import { PtyManager } from './integration/pty-manager';
 import { ClaudePtyManager, ClaudePtyPermission } from './integration/claude-pty-manager';
 import { SessionWatcherManager, SessionEvent } from './integration/session-watcher';
 import { AgentSdkBridge } from './integration/agent-sdk-bridge';
-import { AgentTextAccumulator } from './integration/agent-text-accumulator';
+import { AgentPersistence } from './integration/agent-persistence';
 import { selectBranchMessages } from './db/branch-utils';
 import { scanSkills, SkillInfo } from './integration/skills-scanner';
 import type { PermissionDecision } from './types/agent';
@@ -485,32 +485,18 @@ function flushAllPending(): void {
     flushTimers.delete(id);
     flushAssistantText(id);
   }
-  // Flush any pending agent SDK messages
-  const agentConvs = new Set<string>([
-    ...agentTextAccumulators.keys(),
-    ...agentContentBlocks.keys(),
-    ...agentAssistantMsgIds.keys(),
-  ]);
-  for (const convId of agentConvs) {
-    flushAgentMessages(convId);
+  // Flush any pending agent SDK messages (P0/A5 逻辑已抽到 AgentPersistence)
+  if (agentPersistence) {
+    agentPersistence.flushAll();
   }
 }
 
-// --- Agent SDK message persistence (module-level for before-quit access) ---
 /**
- * P0 修复：以 SDK messageId 为粒度累计流式文本。
- * text_delta 只更新该 messageId 的临时文本；最终 text 覆盖之（绝不追加），
- * 从根本上消除"多个 delta + 最终 text"导致的落库重复。
+ * Agent SDK 持久化（P0 去重 / A5 幽灵消息回滚）— 独立模块，可在内存 SQLite 上
+ * 做集成测试。main.ts 只负责在事件回调里转调。
+ * 在 whenReady 中 messageRepo/conversationRepo 就绪后赋值（先于一切事件回调注册）。
  */
-const agentTextAccumulators = new Map<string, AgentTextAccumulator>();
-const agentAssistantMsgIds = new Map<string, string>();
-const agentContentBlocks = new Map<string, unknown[]>();
-/**
- * A5 修复：agent 发送后尚未产出任何回复的 user message（convId -> message id）。
- * sendMessage 的大部分启动失败（如 SDK 加载失败）不会 reject，而是发出 error
- * 事件；此时若该 user message 还没有任何回复产出，据此精确回滚。
- */
-const pendingAgentUserMessages = new Map<string, string>();
+let agentPersistence!: AgentPersistence;
 /** 持久化队列锁 — 防止并发事件导致数据丢失 */
 const agentPersistenceQueue = new Map<string, Promise<void>>();
 
@@ -528,61 +514,6 @@ function enqueueAgentPersistence(convId: string, fn: () => Promise<void>): void 
       agentPersistenceQueue.delete(convId);
     }
   });
-}
-
-function flushAgentMessages(convId: string): void {
-  // P0：flush 按 messageId 顺序拼接完整文本，并清空 per-message 临时状态
-  const acc = agentTextAccumulators.get(convId);
-  const text = acc ? acc.flush() : undefined;
-  const blocks = agentContentBlocks.get(convId);
-  const msgId = agentAssistantMsgIds.get(convId);
-
-  try {
-    const contentParts: unknown[] = [];
-    if (text && text.trim()) {
-      contentParts.push({ type: 'text', text: text.trim() });
-    }
-    if (blocks && blocks.length > 0) {
-      contentParts.push(...blocks);
-    }
-    const serialized = contentParts.length > 0 ? JSON.stringify(contentParts) : (text || '');
-
-    if (msgId) {
-      messageRepo.updateContent(msgId, serialized);
-    } else if (serialized) {
-      const msg = messageRepo.create(convId, 'assistant', serialized);
-      agentAssistantMsgIds.set(convId, msg.id);
-    }
-
-    const preview = text ? (text.length > 200 ? text.slice(0, 200) + '…' : text) : '';
-    if (preview) {
-      conversationRepo.updateLastMessage(convId, preview);
-    }
-  } catch (err) {
-    console.error('[Main] Failed to persist agent messages:', err);
-  }
-
-  // flush 后清理本轮全部临时状态（含新增的 per-message 累计）
-  agentTextAccumulators.delete(convId);
-  agentAssistantMsgIds.delete(convId);
-  agentContentBlocks.delete(convId);
-}
-
-/**
- * A5 修复：agent 发送被拒（启动失败）时精确回滚刚创建的 user message。
- * 仅当该消息仍是会话最后一条时删除，不影响已有历史。
- */
-function rollbackAgentUserMessage(convId: string, messageId: string): void {
-  try {
-    const msgs = messageRepo.getByConversation(convId);
-    const last = msgs[msgs.length - 1];
-    if (!last || last.id !== messageId) return; // 已有后续内容，不能回滚
-    messageRepo.delete(messageId);
-    const prev = msgs[msgs.length - 2];
-    conversationRepo.updateLastMessage(convId, prev ? prev.content.slice(0, 200) : '');
-  } catch (err) {
-    console.error('[Main] Failed to roll back agent user message:', err);
-  }
 }
 
 /**
@@ -791,7 +722,7 @@ function registerIpcHandlers(): void {
       // 清理全局状态，避免内存泄漏
       clearSessionState(payload.id);
       pendingSendRollback.delete(payload.id);
-      pendingAgentUserMessages.delete(payload.id);
+      agentPersistence.clearPendingUserMessage(payload.id);
       // 同时清理 Claude PTY 会话
       claudePtyManager.kill(payload.id);
       // 停止 session watcher
@@ -1512,70 +1443,37 @@ function registerIpcHandlers(): void {
         event.type === 'thinking' || event.type === 'thinking_delta' ||
         event.type === 'tool_use' || event.type === 'tool_result'
       ) {
-        pendingAgentUserMessages.delete(convId);
+        agentPersistence.markOutputStarted(convId);
       }
 
       switch (event.type) {
-        case 'text': {
-          // Full text block from assistant message — 用完整文本覆盖该 messageId
-          // 的临时文本（绝不追加），消除 delta + 最终 text 的落库重复。
-          const acc = agentTextAccumulators.get(convId) || new AgentTextAccumulator();
-          agentTextAccumulators.set(convId, acc);
-          acc.onFinalText((event as any).messageId, (event as any).text ?? '');
+        case 'text':
+          // 用完整文本覆盖该 messageId 的临时文本（绝不追加），消除落库重复
+          agentPersistence.onText(convId, (event as any).messageId, (event as any).text ?? '');
           break;
-        }
-        case 'text_delta': {
-          // Streaming delta — 只更新该 messageId 的临时文本
-          const acc = agentTextAccumulators.get(convId) || new AgentTextAccumulator();
-          agentTextAccumulators.set(convId, acc);
-          acc.onDelta((event as any).messageId, (event as any).delta ?? '');
+        case 'text_delta':
+          agentPersistence.onTextDelta(convId, (event as any).messageId, (event as any).delta ?? '');
           break;
-        }
-        case 'tool_use': {
-          // Persist tool_use as structured content block
-          const blocks = agentContentBlocks.get(convId) || [];
-          blocks.push({
-            type: 'tool_use',
-            toolName: (event as any).toolName,
-            toolUseId: (event as any).toolUseId,
-            input: (event as any).input,
-          });
-          agentContentBlocks.set(convId, blocks);
+        case 'tool_use':
+          agentPersistence.onToolUse(convId, (event as any).toolName, (event as any).toolUseId, (event as any).input);
           break;
-        }
-        case 'tool_result': {
-          // Persist tool_result
-          const blocks = agentContentBlocks.get(convId) || [];
-          blocks.push({
-            type: 'tool_result',
-            toolUseId: (event as any).toolUseId,
-            content: (event as any).content,
-            isError: (event as any).isError,
-          });
-          agentContentBlocks.set(convId, blocks);
+        case 'tool_result':
+          agentPersistence.onToolResult(convId, (event as any).toolUseId, (event as any).content, (event as any).isError);
           break;
-        }
-        case 'thinking': {
-          const blocks = agentContentBlocks.get(convId) || [];
-          blocks.push({ type: 'thinking', text: (event as any).text });
-          agentContentBlocks.set(convId, blocks);
+        case 'thinking':
+          agentPersistence.onThinking(convId, (event as any).text ?? '');
           break;
-        }
         case 'result': {
           // Turn complete — flush all accumulated messages
-          pendingAgentUserMessages.delete(convId);
-          flushAgentMessages(convId);
+          agentPersistence.clearPendingUserMessage(convId);
+          agentPersistence.flush(convId);
           broadcast(Channels.CONVERSATIONS_CHANGED);
           break;
         }
         case 'error': {
           // A5 修复：发送后未产出任何回复就报错（启动失败）→ 精确回滚
           // user message，不留幽灵消息。已有回复产出时 pending 已被清除。
-          const pendingId = pendingAgentUserMessages.get(convId);
-          if (pendingId) {
-            pendingAgentUserMessages.delete(convId);
-            rollbackAgentUserMessage(convId, pendingId);
-          }
+          agentPersistence.rollbackPendingUserMessage(convId);
           break;
         }
       }
@@ -1638,7 +1536,7 @@ function registerIpcHandlers(): void {
 
         // Flush any previous turn's partial data before starting a new turn,
         // so the accumulated assistant blocks are committed to DB cleanly.
-        flushAgentMessages(payload.convId);
+        agentPersistence.flush(payload.convId);
 
         // Persist the user message to the database (text + attachments)。
         // A13 修复：返回真实 SQLite message id，前端据此替换 optimistic block。
@@ -1651,7 +1549,7 @@ function registerIpcHandlers(): void {
           return { ok: false, error: `Failed to save message: ${(err as Error).message}` };
         }
         // A5：登记待确认启动的 user message（error 事件且无回复产出时回滚）
-        pendingAgentUserMessages.set(payload.convId, userMessage.id);
+        agentPersistence.registerPendingUserMessage(payload.convId, userMessage.id);
 
         // Update session options if provided (for mid-conversation changes)
         agentBridge.updateOptions(payload.convId, {
@@ -1665,8 +1563,7 @@ function registerIpcHandlers(): void {
         // user message，保证被拒的发送不落库。
         agentBridge.sendMessage(payload.convId, payload.text, payload.attachments || []).catch((err) => {
           console.error('[Main] Agent sendMessage failed:', err);
-          pendingAgentUserMessages.delete(payload.convId);
-          rollbackAgentUserMessage(payload.convId, userMessage.id);
+          agentPersistence.rollbackPendingUserMessage(payload.convId);
         });
         return { ok: true, userMessage };
       } catch (err: unknown) {
@@ -1679,7 +1576,7 @@ function registerIpcHandlers(): void {
     Channels.AGENT_ABORT,
     async (_e: IpcMainInvokeEvent, payload: { convId: string }): Promise<{ ok: boolean }> => {
       // A5：用户主动停止 → 消息已真正发出，不回滚
-      pendingAgentUserMessages.delete(payload.convId);
+      agentPersistence.clearPendingUserMessage(payload.convId);
       await agentBridge.abort(payload.convId);
       return { ok: true };
     },
@@ -1710,7 +1607,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     Channels.AGENT_DESTROY,
     (_e: IpcMainInvokeEvent, payload: { convId: string }): { ok: boolean } => {
-      pendingAgentUserMessages.delete(payload.convId);
+      agentPersistence.clearPendingUserMessage(payload.convId);
       agentBridge.destroySession(payload.convId);
       return { ok: true };
     },
@@ -1992,6 +1889,7 @@ app.whenReady().then(async () => {
   database.initialize(app.getPath('userData'));
   conversationRepo = new ConversationRepo(database.instance);
   messageRepo = new MessageRepo(database.instance);
+  agentPersistence = new AgentPersistence(messageRepo, conversationRepo);
 
   // 2. Detect Claude CLI (non-blocking; result cached for renderer queries).
   cliInfo = await detectClaudeCli();

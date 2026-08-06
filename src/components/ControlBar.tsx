@@ -158,7 +158,6 @@ const PermissionSegmented = memo(function PermissionSegmented({
   disabled?: boolean
 }) {
   const [hoveredId, setHoveredId] = useState<PermissionMode | null>(null)
-  const active = modes.find((m) => m.id === selected) || modes[0]
 
   return (
     <div className="flex items-center gap-1.5">
