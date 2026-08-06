@@ -1,10 +1,9 @@
-import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react'
+import { useState, useEffect, useRef, useMemo, memo } from 'react'
 import type { KeyboardEvent } from 'react'
-import { ipc } from '../lib/ipc'
-import { ArrowUp, FileCode, Sparkles, FolderOpen, Zap, Trash2, Plus, HelpCircle, Cpu, Square, Copy, Check, Paperclip, Image as ImageIcon, X as XIcon, Brain, Terminal, ChevronDown, AlertTriangle, GitBranch, Loader2 } from 'lucide-react'
-import { MarkdownContent, CodeBlockView } from '../lib/codeRenderer'
+import { ArrowUp, FileCode, Sparkles, Zap, Cpu, Square, Copy, Check, Paperclip, Image as ImageIcon, X as XIcon, Brain, Terminal, ChevronDown, AlertTriangle, GitBranch, Loader2 } from 'lucide-react'
+import { MarkdownContent } from '../lib/codeRenderer'
 import { ClaudeAvatar, UserAvatar } from './ChatAvatar'
-import type { Message, ModelOption, Attachment, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption, ContentBlock, DiffHunk } from '../types'
+import type { Message, ModelOption, Attachment, PermissionMode, PermissionModeOption, ThinkingEffort, ThinkingEffortOption, ContentBlock } from '../types'
 import ControlBar from './ControlBar'
 import { buildSlashCommands } from '../lib/commands'
 import type { SlashCommand } from '../lib/commands'
@@ -452,7 +451,7 @@ export interface ChatViewProps {
 }
 
 export default function ChatView({
-  messages, onSend, onStop, isStreaming, loading, project,
+  messages, onSend, onStop, isStreaming, loading, project: _project,
   models, selectedModel, onModelSelect, onClearChat, onNewChat,
   permissionMode, onPermissionModeChange, permissionModes,
   onResendWithPermission,
@@ -492,6 +491,15 @@ export default function ChatView({
   const atBottomRef = useRef(true)
   const firstMsgIdRef = useRef<string | undefined>(undefined)
 
+  // 虚拟滚动：只渲染最后 visibleCount 条，向上滚动时经 sentinel 增量加载，
+  // 避免长对话一次性渲染全部消息（每条消息都有 markdown 渲染，成本较高）。
+  const [visibleCount, setVisibleCount] = useState(50)
+  const sentinelRef = useRef<HTMLDivElement>(null)
+  const prevVisibleRef = useRef(visibleCount)
+  const visibleMessages = messages.slice(-visibleCount)
+  const hasMore = messages.length > visibleCount
+  const msgOffset = messages.length - visibleCount
+
   const handleScroll = () => {
     const el = scrollRef.current
     if (!el) return
@@ -502,11 +510,42 @@ export default function ChatView({
     const firstId = messages[0]?.id
     const switched = firstId !== firstMsgIdRef.current
     firstMsgIdRef.current = firstId
-    if (switched) atBottomRef.current = true
+    if (switched) {
+      atBottomRef.current = true
+      setVisibleCount(50) // 切换会话时重置虚拟滚动窗口
+    }
     if (atBottomRef.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: switched || isStreaming ? 'auto' : 'smooth' })
     }
   }, [messages, isStreaming])
+
+  // 向上加载更多时保持视口位置（顶部插入内容会推高 scrollHeight，按增量补偿）
+  useEffect(() => {
+    const delta = visibleCount - prevVisibleRef.current
+    prevVisibleRef.current = visibleCount
+    if (delta > 0 && scrollRef.current) {
+      const el = scrollRef.current
+      const prevHeight = el.scrollHeight
+      requestAnimationFrame(() => {
+        el.scrollTop += el.scrollHeight - prevHeight
+      })
+    }
+  }, [visibleCount])
+
+  // IntersectionObserver sentinel：滚到顶部附近时加载更多消息
+  useEffect(() => {
+    if (!sentinelRef.current || !hasMore) return
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisibleCount(prev => Math.min(prev + 50, messages.length))
+        }
+      },
+      { root: scrollRef.current, threshold: 0.1 }
+    )
+    observer.observe(sentinelRef.current)
+    return () => observer.disconnect()
+  }, [hasMore, messages.length])
 
   // Auto-grow the textarea up to its max height.
   useEffect(() => {
@@ -716,9 +755,19 @@ export default function ChatView({
             </div>
           )}
 
-          {/* Messages */}
-          {messages.map((msg, idx) =>
-            msg.role === 'user'
+          {/* 虚拟滚动：向上滚动时经 sentinel 加载更多 */}
+          {hasMore && (
+            <div ref={sentinelRef} className="flex items-center justify-center py-2">
+              <span className="text-[11px]" style={{ color: 'var(--fg-quaternary)' }}>
+                {msgOffset} more messages above
+              </span>
+            </div>
+          )}
+
+          {/* Messages（只渲染最后 visibleCount 条，idx 保持全局真实下标） */}
+          {visibleMessages.map((msg, i) => {
+            const idx = msgOffset + i
+            return msg.role === 'user'
               ? <UserMessage key={msg.id} msg={msg} idx={idx} />
               : <AssistantMessage
                   key={msg.id}
@@ -726,7 +775,7 @@ export default function ChatView({
                   idx={idx}
                   onResendWithPermission={onResendWithPermission}
                 />
-          )}
+          })}
 
           {/* Typing indicator (only before the first token arrives) */}
           {isStreaming && (!messages.length || messages[messages.length - 1].role !== 'assistant' || !messages[messages.length - 1].content) && (
