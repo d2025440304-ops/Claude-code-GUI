@@ -4,15 +4,15 @@
  */
 import { memo } from 'react'
 
-/** Claude Code 助手头像：紫色渐变圆底 + 星芒 logo（SVG） */
+/** Claude Code 助手头像：渐变圆底 + 星芒 logo（SVG） */
 export const ClaudeAvatar = memo(function ClaudeAvatar({ size = 28 }: { size?: number }) {
   return (
     <div
       style={{
         width: size, height: size, borderRadius: '50%', flexShrink: 0,
-        background: 'linear-gradient(145deg, #7c5bf5 0%, #a78bfa 40%, #c084fc 100%)',
+        background: 'linear-gradient(145deg, var(--accent-primary) 0%, var(--accent-bright) 40%, color-mix(in srgb, var(--accent-bright) 80%, white) 100%)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
-        boxShadow: '0 2px 8px rgba(124,91,245,0.3), 0 0 0 1px rgba(255,255,255,0.08)',
+        boxShadow: '0 2px 8px var(--accent-glow), 0 0 0 1px rgba(255,255,255,0.08)',
       }}
     >
       {/* 星芒（Claude logo 风格） */}

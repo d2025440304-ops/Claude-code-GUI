@@ -59,6 +59,8 @@ export default function TerminalView({ projectPath }: TerminalViewProps) {
     containerEl.style.display = 'none'
     wrapperRef.current?.appendChild(containerEl)
 
+    // 获取当前主题色
+    const accentColor = getComputedStyle(document.documentElement).getPropertyValue('--accent-primary').trim() || '#7c5bf5'
     // 创建 xterm 实例
     const terminal = new Terminal({
       fontSize: 13,
@@ -66,9 +68,9 @@ export default function TerminalView({ projectPath }: TerminalViewProps) {
       theme: {
         background: '#0c0c10',
         foreground: '#e0e0e0',
-        cursor: '#7c5bf5',
+        cursor: accentColor,
         cursorAccent: '#0c0c10',
-        selectionBackground: 'rgba(124, 91, 245, 0.3)',
+        selectionBackground: accentColor + '4D', /* 30% opacity */
         black: '#1e1e2e', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
         blue: '#89b4fa', magenta: '#f5c2e7', cyan: '#94e2d5', white: '#cdd6f4',
         brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',

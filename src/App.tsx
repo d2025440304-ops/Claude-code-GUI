@@ -216,6 +216,13 @@ export default function App() {
       return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
     } catch { return 'dark' }
   })
+  const [themeColor, setThemeColor] = useState<'purple' | 'blue' | 'yellow' | 'red'>(() => {
+    try {
+      const stored = localStorage.getItem('ccd:themeColor')
+      if (stored === 'blue' || stored === 'yellow' || stored === 'red') return stored
+      return 'purple'
+    } catch { return 'purple' }
+  })
   // Active project context for new chats; follows the selected conversation.
   const [newChatProjectPath, setNewChatProjectPath] = useState<string | null>(() => {
     try { return localStorage.getItem('ccd:project') || null } catch { return null }
@@ -338,6 +345,14 @@ export default function App() {
     else root.removeAttribute('data-theme')
     try { localStorage.setItem('ccd:theme', theme) } catch {}
   }, [theme])
+
+  // Apply + persist theme color on <html>.
+  useEffect(() => {
+    const root = document.documentElement
+    if (themeColor === 'purple') root.removeAttribute('data-theme-color')
+    else root.setAttribute('data-theme-color', themeColor)
+    try { localStorage.setItem('ccd:themeColor', themeColor) } catch {}
+  }, [themeColor])
 
   // 监听系统主题变化：当用户没有手动设置过主题时，自动跟随系统主题
   useEffect(() => {
@@ -1125,9 +1140,9 @@ export default function App() {
             <div
               style={{
                 width: 32, height: 32, borderRadius: 10,
-                background: 'linear-gradient(145deg, #7c5bf5 0%, #a78bfa 40%, #c084fc 100%)',
+                background: 'linear-gradient(145deg, var(--accent-primary) 0%, var(--accent-bright) 40%, color-mix(in srgb, var(--accent-bright) 80%, white) 100%)',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                boxShadow: '0 2px 12px rgba(124,91,245,0.35), 0 0 0 1px rgba(255,255,255,0.06)',
+                boxShadow: '0 2px 12px var(--accent-glow), 0 0 0 1px rgba(255,255,255,0.06)',
                 position: 'relative',
               }}
             >
@@ -1385,6 +1400,31 @@ export default function App() {
               >
                 {theme === 'dark' ? <Sun size={14} className="text-[var(--fg-tertiary)]" /> : <Moon size={14} className="text-[var(--fg-tertiary)]" />}
               </button>
+              {/* Quick color accent switcher */}
+              <div className="flex items-center gap-0.5 ml-0.5 pl-1.5" style={{ borderLeft: '1px solid var(--border-subtle)' }}>
+                {(['purple', 'blue', 'yellow', 'red'] as const).map((color) => {
+                  const colorMap: Record<string, string> = {
+                    purple: '#7c5bf5',
+                    blue: '#3b82f6',
+                    yellow: '#eab308',
+                    red: '#ef4444',
+                  }
+                  return (
+                    <button
+                      key={color}
+                      onClick={() => setThemeColor(color)}
+                      className="w-3.5 h-3.5 rounded-full transition-all"
+                      style={{
+                        background: colorMap[color],
+                        opacity: themeColor === color ? 1 : 0.35,
+                        transform: themeColor === color ? 'scale(1.25)' : 'scale(1)',
+                        boxShadow: themeColor === color ? `0 0 6px ${colorMap[color]}` : 'none',
+                      }}
+                      title={`Accent: ${color.charAt(0).toUpperCase() + color.slice(1)}`}
+                    />
+                  )
+                })}
+              </div>
               <button
                 onClick={() => setShowSettings(true)}
                 className="p-1.5 rounded-lg transition-colors hover:bg-[var(--tint-hover)]"
@@ -1721,6 +1761,40 @@ export default function App() {
                             </button>
                           </div>
                         </div>
+                        {/* Accent color */}
+                        <div>
+                          <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>Accent Color</div>
+                          <div className="flex items-center gap-2.5">
+                            {(['purple', 'blue', 'yellow', 'red'] as const).map((color) => {
+                              const colorMap: Record<string, string> = {
+                                purple: '#7c5bf5',
+                                blue: '#3b82f6',
+                                yellow: '#eab308',
+                                red: '#ef4444',
+                              }
+                              return (
+                                <button
+                                  key={color}
+                                  onClick={() => setThemeColor(color)}
+                                  className="w-8 h-8 rounded-xl transition-all flex items-center justify-center"
+                                  style={{
+                                    background: colorMap[color],
+                                    boxShadow: themeColor === color
+                                      ? `0 0 0 2px var(--bg-surface), 0 0 0 4px ${colorMap[color]}`
+                                      : 'none',
+                                    transform: themeColor === color ? 'scale(1.1)' : 'scale(1)',
+                                    opacity: themeColor === color ? 1 : 0.6,
+                                  }}
+                                  title={color.charAt(0).toUpperCase() + color.slice(1)}
+                                >
+                                  {themeColor === color && (
+                                    <Check size={12} strokeWidth={3} color="white" />
+                                  )}
+                                </button>
+                              )
+                            })}
+                          </div>
+                        </div>
                         <div>
                           <div className="text-[11px] font-semibold uppercase text-[var(--fg-quaternary)] mb-2.5" style={{ letterSpacing: '0.06em' }}>Claude CLI</div>
                           <div className="flex items-center gap-2.5 text-[12px]">
@@ -1805,7 +1879,7 @@ export default function App() {
                                   className="flex items-center gap-3 px-3.5 py-2.5 rounded-xl"
                                   style={{ background: 'var(--bg-surface-2)', border: '1px solid var(--border-default)' }}
                                 >
-                                  <div className="flex-shrink-0 w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: 'rgba(124,91,245,0.12)' }}>
+                                  <div className="flex-shrink-0 w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: 'var(--accent-subtle)' }}>
                                     <Sparkles size={13} style={{ color: 'var(--accent-bright)' }} />
                                   </div>
                                   <div className="flex-1 min-w-0">
@@ -1817,7 +1891,7 @@ export default function App() {
                                         className="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded"
                                         style={{
                                           color: skill.source === 'user' ? 'var(--accent-bright)' : 'var(--fg-tertiary)',
-                                          background: skill.source === 'user' ? 'rgba(124,91,245,0.12)' : 'var(--tint-subtle)',
+                                          background: skill.source === 'user' ? 'var(--accent-subtle)' : 'var(--tint-subtle)',
                                           letterSpacing: '0.04em',
                                         }}
                                       >
@@ -1924,9 +1998,9 @@ export default function App() {
                         <div
                           style={{
                             width: 44, height: 44, borderRadius: 14,
-                            background: 'linear-gradient(145deg, #7c5bf5 0%, #a78bfa 40%, #c084fc 100%)',
+                            background: 'linear-gradient(145deg, var(--accent-primary) 0%, var(--accent-bright) 40%, color-mix(in srgb, var(--accent-bright) 80%, white) 100%)',
                             display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            boxShadow: '0 4px 16px rgba(124,91,245,0.35)',
+                            boxShadow: '0 4px 16px var(--accent-glow)',
                           }}
                         >
                           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

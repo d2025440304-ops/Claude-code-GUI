@@ -140,6 +140,8 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
       setState({ status: 'creating' })
     }
 
+    // 获取当前主题色
+    const accentColor = getComputedStyle(document.documentElement).getPropertyValue('--accent-primary').trim() || '#7c5bf5'
     // Create xterm instance
     const terminal = new Terminal({
       fontSize: 13,
@@ -147,9 +149,9 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
       theme: {
         background: '#0c0c10',
         foreground: '#e0e0e0',
-        cursor: '#7c5bf5',
+        cursor: accentColor,
         cursorAccent: '#0c0c10',
-        selectionBackground: 'rgba(124, 91, 245, 0.3)',
+        selectionBackground: accentColor + '4D', /* 30% opacity */
         black: '#1e1e2e', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
         blue: '#89b4fa', magenta: '#f5c2e7', cyan: '#94e2d5', white: '#cdd6f4',
         brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
@@ -403,15 +405,16 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
     const root = document.documentElement
     const updateTheme = () => {
       const isLight = root.getAttribute('data-theme') === 'light'
+      const accentColor = getComputedStyle(root).getPropertyValue('--accent-primary').trim() || '#7c5bf5'
       const term = terminalRef.current
       if (term) {
         term.options.theme = isLight
           ? {
               background: '#fafafa',
               foreground: '#1e1e2e',
-              cursor: '#7c5bf5',
+              cursor: accentColor,
               cursorAccent: '#fafafa',
-              selectionBackground: 'rgba(124, 91, 245, 0.2)',
+              selectionBackground: accentColor + '33', /* 20% opacity */
               black: '#1e1e2e', red: '#d20f39', green: '#40a02b', yellow: '#df8e1d',
               blue: '#1e66f5', magenta: '#ea76cb', cyan: '#179299', white: '#bcc0cc',
               brightBlack: '#5c5f77', brightRed: '#d20f39', brightGreen: '#40a02b',
@@ -421,9 +424,9 @@ export default function ClaudeTerminalView(props: ClaudeTerminalViewProps) {
           : {
               background: '#0c0c10',
               foreground: '#e0e0e0',
-              cursor: '#7c5bf5',
+              cursor: accentColor,
               cursorAccent: '#0c0c10',
-              selectionBackground: 'rgba(124, 91, 245, 0.3)',
+              selectionBackground: accentColor + '4D', /* 30% opacity */
               black: '#1e1e2e', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
               blue: '#89b4fa', magenta: '#f5c2e7', cyan: '#94e2d5', white: '#cdd6f4',
               brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',

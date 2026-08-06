@@ -76,7 +76,7 @@ function ConversationItem({ conv, active, editing, onClick, onPinToggle, onConte
           ? 'var(--accent-subtle)'
           : hovered ? 'var(--tint-subtle)' : 'transparent',
         transition: 'all 180ms var(--ease-smooth)',
-        border: active ? '1px solid rgba(124,91,245,0.14)' : '1px solid transparent',
+        border: active ? '1px solid var(--border-accent)' : '1px solid transparent',
       }}
     >
       {/* Pin indicator */}
@@ -107,7 +107,7 @@ function ConversationItem({ conv, active, editing, onClick, onPinToggle, onConte
           onBlur={() => onRenameCommit(editValue.trim() || conv.title)}
           onClick={(e) => e.stopPropagation()}
           className="flex-1 text-[13px] font-medium bg-[var(--bg-input)] border border-[var(--accent-primary)] rounded-lg px-2 py-0.5 outline-none"
-          style={{ color: 'var(--fg-primary)', boxShadow: '0 0 0 3px rgba(124,91,245,0.12)' }}
+          style={{ color: 'var(--fg-primary)', boxShadow: '0 0 0 3px var(--accent-ring)' }}
         />
       ) : (
         <>
